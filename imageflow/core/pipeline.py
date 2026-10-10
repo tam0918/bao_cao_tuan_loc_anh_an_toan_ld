@@ -407,6 +407,94 @@ class ImageFlowJob:
         if folder_id not in self.project.active_ids():
             self._note_error(sha, "DESTINATION_MISSING")
             return
+
+        if self.safety_screen is not None:
+            status = await self._ensure_safety(sha)
+            if status is None:
+                return
+            if status == "SAFE":
+                self._set_state(sha, ImageState.COMPLETE)
+                self._log.emit("complete", image_id=sha, folder_id=folder_id, actions=[], ppe_status="SAFE")
+                return
+            if status == "REVIEW":
+                self.report.safety_review_required += 1
+                self._set_state(sha, ImageState.COMPLETE)
+                self._log.emit("complete", image_id=sha, folder_id=folder_id, actions=[], ppe_status="REVIEW")
+                return
+            action_types = [self.safety_action_type] if self.safety_action_type else []
+        else:
+            action_types = self.project.actions_for(folder_id)
+
+        if not action_types:
+            self._set_state(sha, ImageState.COMPLETE)
+            self._log.emit("complete", image_id=sha, folder_id=folder_id, actions=[])
+            return
+        if self._state(sha) == ImageState.ROUTED:
+            self._set_state(sha, ImageState.ACTION_PENDING)
+        for atype in action_types:
+            existing = _find_action(self.manifest.get(sha)["actions"], atype)
+            if existing and existing["status"] == "SUCCESS":
+                continue
+            if existing and existing.get("permanent"):
+                return
+            if not await self._run_action(sha, atype, folder_id):
+                return
+        self._set_state(sha, ImageState.COMPLETE)
+        self._log.emit("complete", image_id=sha, folder_id=folder_id, actions=action_types)
+
+    async def _ensure_safety(self, sha: str) -> str | None:
+        rec = self.manifest.get(sha)
+        previous = rec.get("safety") or {}
+        if previous.get("status") in {"SAFE", "NEEDS_EDIT", "REVIEW"}:
+            return previous["status"]
+
+        src = self._abs(rec["current_rel"])
+        if not src.exists():
+            self._fail(sha, "SOURCE_MISSING")
+            return None
+        try:
+            encoded = normalize_file(src, self._dirs["normalized"], rec["sha256"])
+        except PermanentError as exc:
+            self._fail(sha, exc.code)
+            return None
+
+        try:
+            async with self._classify_sem:
+                decision = await self.safety_screen.decide(encoded)
+        except ClassifierUnavailable:
+            self._note_error(sha, "SAFETY_CLASSIFIER_UNAVAILABLE")
+            self.report.deferred += 1
+            return None
+        except PermanentError as exc:
+            if exc.code == "AUTH_FAILED":
+                raise JobAborted(str(exc)) from exc
+            self._fail(sha, exc.code)
+            return None
+
+        safety = {
+            "status": decision.status,
+            "provider": decision.provider,
+            "model": decision.model,
+            "confidence": round(decision.confidence, 6),
+            "attempts": decision.attempts,
+        }
+        self.manifest.transition(sha, ImageState(rec["state"]), safety=safety, last_error=None)
+        self._log.emit(
+            "safety_screened",
+            image_id=sha,
+            content_sha256=rec["sha256"],
+            folder_id=folder_id if (folder_id := rec["routing"]["folder_id"]) else None,
+            status=decision.status,
+            confidence=round(decision.confidence, 6),
+        )
+        return decision.status
+
+    async def _run_actions(self, sha: str) -> None:
+        rec = self.manifest.get(sha)
+        folder_id = rec["routing"]["folder_id"]
+        if folder_id not in self.project.active_ids():
+            self._note_error(sha, "DESTINATION_MISSING")
+            return
         action_types = self.project.actions_for(folder_id)
         if not action_types:
             self._set_state(sha, ImageState.COMPLETE)
