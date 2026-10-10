@@ -31,6 +31,7 @@ from .manifest import ManifestStore, atomic_write_bytes
 from .metrics import JobMetrics
 from .project import ProjectStore
 from .routing import DestinationMissing, deterministic_name, plan_recovery, route_file
+from .safety import SafetyScreenEngine
 from .state_machine import RESUMABLE_STATES, ImageState
 from .workspace import ImageFile, ScanResult, choice_description, scan_workspace
 
@@ -64,6 +65,7 @@ class JobReport:
     actioned: int = 0
     failed: int = 0
     actions_failed: int = 0
+    safety_review_required: int = 0
     deferred: int = 0
     internal_errors: int = 0  # unexpected exceptions, logged and isolated to one image
     unsupported: list[str] = field(default_factory=list)
@@ -78,6 +80,8 @@ class ImageFlowJob:
         root: Path,
         classifier: ClassificationEngine,
         actions: ActionRegistry,
+        safety_screen: SafetyScreenEngine | None = None,
+        safety_action_type: str | None = None,
         config: PipelineConfig = PipelineConfig(),
         job_id: str | None = None,
     ) -> None:
@@ -85,6 +89,8 @@ class ImageFlowJob:
         self.system = self.root / SYSTEM_DIR
         self.classifier = classifier
         self.actions = actions
+        self.safety_screen = safety_screen
+        self.safety_action_type = safety_action_type
         self.config = config
         self.job_id = job_id or f"j_{uuid.uuid4().hex[:10]}"
         self.manifest = ManifestStore(self.system)
@@ -168,7 +174,7 @@ class ImageFlowJob:
 
     async def assign(self, sha256: str, folder_id: str) -> None:
         """The user picks the folder for an image in review. It is then routed and actioned like any other."""
-        self._new_limits(classify=False)
+        self._new_limits(classify=True)
         if self._scan is None:
             self.prepare()
         rec = self.manifest.get(sha256)
@@ -232,6 +238,7 @@ class ImageFlowJob:
             "state": ImageState.DISCOVERED.value,
             "normalized_rel": None,
             "classification": None,
+            "safety": None,
             "attempts": [],
             "review": None,
             "review_copy_rel": None,
