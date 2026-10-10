@@ -20,7 +20,7 @@ from .state_machine import ImageState, check_transition
 
 SNAPSHOT_NAME = "manifest.json"
 JOURNAL_NAME = "manifest.journal.jsonl"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 COMPACT_EVERY = 500  # journal entries before an automatic snapshot
 
 
@@ -49,7 +49,7 @@ class ManifestStore:
         if self._snapshot_path.exists():
             snap = json.loads(self._snapshot_path.read_text(encoding="utf-8"))
             for rec in snap.get("records", []):
-                self._records[rec["sha256"]] = rec
+                self._records[rec.get("image_id") or rec["sha256"]] = rec
         self._journal_len = 0
         if self._journal_path.exists():
             with open(self._journal_path, "r", encoding="utf-8") as fh:
@@ -63,13 +63,21 @@ class ManifestStore:
                         # A torn final line from a crash mid-append. Nothing after it can
                         # be valid, so stop replaying here.
                         break
-                    self._records[rec["sha256"]] = rec
+                    self._records[rec.get("image_id") or rec["sha256"]] = rec
                     self._journal_len += 1
 
     # ----- reads ---------------------------------------------------------------
-    def get(self, sha256: str) -> dict[str, Any] | None:
-        rec = self._records.get(sha256)
+    def get(self, key: str) -> dict[str, Any] | None:
+        """Get by stable image_id. For V1 compatibility, a unique content SHA also resolves."""
+        resolved = self._resolve_key(key)
+        rec = self._records.get(resolved) if resolved is not None else None
         return dict(rec) if rec is not None else None
+
+    def _resolve_key(self, key: str) -> str | None:
+        if key in self._records:
+            return key
+        matches = [rid for rid, rec in self._records.items() if rec.get("sha256") == key]
+        return matches[0] if len(matches) == 1 else None
 
     def all(self) -> list[dict[str, Any]]:
         return [dict(r) for r in self._records.values()]
@@ -88,14 +96,17 @@ class ManifestStore:
             fh.write(line)
             fh.flush()
             os.fsync(fh.fileno())
-        self._records[record["sha256"]] = record
+        self._records[record["image_id"]] = record
         self._journal_len += 1
         if self._journal_len >= COMPACT_EVERY:
             self.compact()
 
-    def transition(self, sha256: str, target: ImageState, **fields: Any) -> dict[str, Any]:
+    def transition(self, key: str, target: ImageState, **fields: Any) -> dict[str, Any]:
         """Move a record to ``target`` (validated) and persist it together with ``fields``."""
-        rec = self._records[sha256]
+        resolved = self._resolve_key(key)
+        if resolved is None:
+            raise KeyError(key)
+        rec = self._records[resolved]
         current = ImageState(rec["state"])
         if current != target:
             check_transition(current, target)
