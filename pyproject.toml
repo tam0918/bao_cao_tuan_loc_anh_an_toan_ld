@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imageflow"
+version = "1.0.0"
+description = "Phân loại ảnh theo thư mục do người dùng tự định nghĩa, sau đó chạy action được gán cho từng thư mục."
+requires-python = ">=3.11"
+dependencies = ["Pillow>=10.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+imageflow = "imageflow.app:main"
+
+[tool.setuptools.packages.find]
+include = ["imageflow*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
