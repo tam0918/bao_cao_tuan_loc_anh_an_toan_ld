@@ -93,8 +93,14 @@ class ImageFlowJob:
         self._dirs = {name: self.system / name for name in SYSTEM_SUBDIRS}
         self._scan: ScanResult | None = None
         self._log: EventLog | None = None
-        self._classify_sem = asyncio.Semaphore(config.classify_concurrency)
-        self._edit_sem = asyncio.Semaphore(config.edit_concurrency)
+        # Created per event loop (see _new_limits): asyncio primitives must not outlive their loop.
+        self._classify_sem: asyncio.Semaphore | None = None
+        self._edit_sem: asyncio.Semaphore | None = None
+
+    def _new_limits(self, classify: bool) -> None:
+        if classify:
+            self._classify_sem = asyncio.Semaphore(self.config.classify_concurrency)
+        self._edit_sem = asyncio.Semaphore(self.config.edit_concurrency)
 
     # ----- setup and read-only views -------------------------------------------
     def prepare(self) -> ScanResult:
@@ -144,6 +150,7 @@ class ImageFlowJob:
     # ----- run -----------------------------------------------------------------
     async def run(self) -> JobReport:
         started = time.perf_counter()
+        self._new_limits(classify=True)
         self.prepare()
         choices = self.choices()
         pending = self._pending()
@@ -160,6 +167,7 @@ class ImageFlowJob:
 
     async def assign(self, sha256: str, folder_id: str) -> None:
         """The user picks the folder for an image in review. It is then routed and actioned like any other."""
+        self._new_limits(classify=False)
         if self._scan is None:
             self.prepare()
         rec = self.manifest.get(sha256)
