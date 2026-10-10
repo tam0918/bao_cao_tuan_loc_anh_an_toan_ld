@@ -10,6 +10,7 @@ Ordering rules that keep the job crash-safe:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -192,35 +193,39 @@ class ImageFlowJob:
     # ----- planning --------------------------------------------------------------
     def _pending(self) -> list[str]:
         assert self._scan is not None
-        seen: set[str] = set()
+        seen_instances: set[str] = set()
         pending: list[str] = []
         for img in sorted(self._scan.images, key=lambda i: i.name):
-            sha = sha256_file(img.path)
-            if sha in seen:
-                self.report.skipped_duplicates += 1  # identical bytes already handled in this run
-                continue
-            seen.add(sha)
-            rec = self.manifest.get(sha)
+            content_sha = sha256_file(img.path)
+            image_id = self._instance_id(img.rel, content_sha)
+            seen_instances.add(image_id)
+            rec = self.manifest.get(image_id)
             if rec is None:
-                self.manifest.put(self._new_record(sha, img))
-                pending.append(sha)
+                self.manifest.put(self._new_record(image_id, content_sha, img))
+                pending.append(image_id)
                 continue
             state = ImageState(rec["state"])
             if state == ImageState.COMPLETE:
-                self.report.skipped_duplicates += 1  # already processed, never duplicated
+                self.report.skipped_duplicates += 1  # this exact file instance was already processed
             elif state in RESUMABLE_STATES:
-                pending.append(sha)
+                pending.append(image_id)
             # REVIEW_REQUIRED waits for the user. FAILED needs a human fix. Neither is re-run here.
         # Images that already left the root (routed, mid-action) still need to finish.
         for rec in self.manifest.all():
-            if rec["sha256"] not in seen and ImageState(rec["state"]) in RESUMABLE_STATES:
-                pending.append(rec["sha256"])
+            if rec["image_id"] not in seen_instances and ImageState(rec["state"]) in RESUMABLE_STATES:
+                pending.append(rec["image_id"])
         return pending
 
-    def _new_record(self, sha: str, img: ImageFile) -> dict[str, Any]:
+    @staticmethod
+    def _instance_id(source_rel: str, content_sha: str) -> str:
+        """Stable identity for one file instance. Content SHA is only a cache/integrity key."""
+        digest = hashlib.sha256((source_rel + "\0" + content_sha).encode("utf-8")).hexdigest()
+        return "im_" + digest[:24]
+
+    def _new_record(self, image_id: str, content_sha: str, img: ImageFile) -> dict[str, Any]:
         return {
-            "image_id": "im_" + sha[:12],
-            "sha256": sha,
+            "image_id": image_id,
+            "sha256": content_sha,
             "original_filename": img.name,
             "source_path": img.rel,
             "current_rel": img.rel,
@@ -263,12 +268,12 @@ class ImageFlowJob:
             self._fail(sha, "SOURCE_MISSING")
             return False
         try:
-            encoded = normalize_file(src, self._dirs["normalized"], sha)
+            encoded = normalize_file(src, self._dirs["normalized"], rec["sha256"])
         except PermanentError as exc:
             self._fail(sha, exc.code)
             return False
         if rec["state"] == ImageState.DISCOVERED.value:
-            normalized_rel = self._rel(self._dirs["normalized"] / f"{sha}.jpg")
+            normalized_rel = self._rel(self._dirs["normalized"] / f"{rec['sha256']}.jpg")
             self.manifest.transition(sha, ImageState.NORMALIZED, normalized_rel=normalized_rel)
         if not choices:
             return False  # no category folder yet. The image waits in NORMALIZED.
@@ -346,7 +351,7 @@ class ImageFlowJob:
         if state == ImageState.ROUTING:
             routing = rec.get("routing") or {}
             planned = self._abs(routing["destination_path"]) if routing.get("destination_path") else None
-            plan = plan_recovery(src, planned, sha, mode)
+            plan = plan_recovery(src, planned, rec["sha256"], mode)
             self._log.emit("route_recovered", sha256=sha, plan=plan.action)
             if plan.action == "LOST_SOURCE":
                 self._fail(sha, "LOST_SOURCE")
@@ -435,11 +440,11 @@ class ImageFlowJob:
         if not src.exists():
             return self._action_failed(sha, atype, {}, "SOURCE_MISSING", permanent=True)
         try:
-            encoded = normalize_file(src, self._dirs["normalized"], sha)
+            encoded = normalize_file(src, self._dirs["normalized"], rec["sha256"])
         except PermanentError as exc:
             return self._action_failed(sha, atype, {}, exc.code, permanent=True)
 
-        context = ActionContext(job_id=self.job_id, image_sha256=sha, folder_id=folder_id, original_name=rec["original_filename"])
+        context = ActionContext(job_id=self.job_id, image_sha256=rec["sha256"], folder_id=folder_id, original_name=rec["original_filename"])
         try:
             async with self._edit_sem:
                 result = await plugin.execute(encoded, context)
