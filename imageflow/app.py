@@ -20,6 +20,7 @@ from .actions.ppe_simulation import PpeSimulationAction
 from .classifiers.clef import ClefClassifierProvider
 from .core.classification import ClassificationEngine
 from .core.pipeline import ImageFlowJob, JobAborted, PipelineConfig
+from .core.safety import SafetyScreenEngine
 from .core.workspace import scan_workspace
 from .image_editors.seedream import Seedream5FlashProvider
 from .infrastructure.gateway import GatewayClient
@@ -65,13 +66,27 @@ def build_job(root: Path, env: Mapping[str, str] = os.environ, job_id: str | Non
         ClefClassifierProvider(gateway, PRIMARY_CLASSIFIER_MODEL),
         ClefClassifierProvider(gateway, FALLBACK_CLASSIFIER_MODEL),
     )
+    safety_screen = SafetyScreenEngine(
+        ClassificationEngine(
+            ClefClassifierProvider(gateway, PRIMARY_CLASSIFIER_MODEL),
+            ClefClassifierProvider(gateway, FALLBACK_CLASSIFIER_MODEL),
+        )
+    )
     actions = ActionRegistry()
     actions.register(PpeSimulationAction(Seedream5FlashProvider(gateway, EDIT_MODEL)))
     config = PipelineConfig(
         classify_concurrency=_positive_int(env, ENV_CLASSIFY_CONCURRENCY, 4),
         edit_concurrency=_positive_int(env, ENV_EDIT_CONCURRENCY, 2),
     )
-    return ImageFlowJob(root, classifier, actions, config=config, job_id=job_id)
+    return ImageFlowJob(
+        root,
+        classifier,
+        actions,
+        safety_screen=safety_screen,
+        safety_action_type="PPE_SIMULATION",
+        config=config,
+        job_id=job_id,
+    )
 
 
 def _cmd_scan(folder: Path) -> int:
