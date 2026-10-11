@@ -31,7 +31,7 @@ ENV_CLASSIFY_CONCURRENCY = "IMAGEFLOW_CLASSIFY_CONCURRENCY"
 ENV_EDIT_CONCURRENCY = "IMAGEFLOW_EDIT_CONCURRENCY"
 
 PRIMARY_CLASSIFIER_MODEL = "clef-flash"
-FALLBACK_CLASSIFIER_MODEL = "clef"
+FALLBACK_CLASSIFIER_MODEL = "clef-omni"
 EDIT_MODEL = "seedream-5.0-flash"
 
 # Suffixes of derived outputs. The scanner never treats these as unclassified images.
