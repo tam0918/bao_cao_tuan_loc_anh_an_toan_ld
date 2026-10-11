@@ -109,7 +109,7 @@ def test_run_routes_and_acts_through_the_gateway(tmp_path, gateway, capsys):
 
     assert code == 0
     assert stub.rejected_auth == 0  # the device token was sent and accepted
-    assert stub.classify_models == ["clef-flash"] * 4  # 2 folder decisions + 2 independent PPE screens
+    assert stub.classify_models == ["clef-omni"] * 4  # Omni is primary for both folder routing and PPE screening
     assert stub.edit_models == ["seedream-5.0-flash"]  # only the PPE-missing image is edited
     assert (root / "Mất an toàn lao động" / "red.jpg").exists()
     assert (root / "Nghiệm thu" / "green.jpg").exists()
