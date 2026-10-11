@@ -415,17 +415,16 @@ def test_name_collision_gets_a_deterministic_suffix(tmp_path):
     assert folder_files(root, "Khu") == ["red.jpg", "red__2.jpg"]
 
 
-def test_duplicate_bytes_in_root_are_processed_once(tmp_path):
+def test_duplicate_bytes_are_distinct_file_instances(tmp_path):
     root = tmp_path / "job"
     (root / "Khu").mkdir(parents=True)
     write_image(root / "a.jpg", RED)
     write_image(root / "b.jpg", RED)  # identical bytes
     clf = ScriptedClassifier(routed_to({RED: "Khu"}))
     report = run(build_job(root, clf))
-    assert clf.count == 1
-    assert report.skipped_duplicates == 1
-    assert folder_files(root, "Khu") == ["a.jpg"]
-    assert (root / "b.jpg").exists()
+    assert clf.count == 2
+    assert report.skipped_duplicates == 0
+    assert folder_files(root, "Khu") == ["a.jpg", "b.jpg"]
 
 
 def test_classifier_outage_moves_nothing_and_next_run_completes(tmp_path):
