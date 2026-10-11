@@ -44,9 +44,14 @@ class GatewayStub:
                     colour = img.convert("RGB").getpixel((img.width // 2, img.height // 2))
                 if self.path == "/v1/classify":
                     stub.classify_models.append(payload["model"])
-                    label = nearest(colour, stub.palette)  # the palette maps colour -> folder name
-                    probs = {c["id"]: (0.95 if c["label"] == label else 0.025) for c in payload["choices"]}
-                    winner = max(probs, key=probs.__getitem__)
+                    ids = {c["id"] for c in payload["choices"]}
+                    if "ppe_needs_edit" in ids:
+                        winner = "ppe_needs_edit" if nearest(colour, {RED: "red", GREEN: "green"}) == "red" else "ppe_ok"
+                        probs = {c["id"]: (0.95 if c["id"] == winner else 0.025) for c in payload["choices"]}
+                    else:
+                        label = nearest(colour, stub.palette)
+                        probs = {c["id"]: (0.95 if c["label"] == label else 0.025) for c in payload["choices"]}
+                        winner = max(probs, key=probs.__getitem__)
                     return self._send(200, {"choice_id": winner, "confidence": probs[winner], "probabilities": probs, "model": payload["model"]})
                 if self.path == "/v1/edit":
                     stub.edit_models.append(payload["model"])
@@ -100,12 +105,12 @@ def test_run_routes_and_acts_through_the_gateway(tmp_path, gateway, capsys):
     write_image(root / "green.jpg", GREEN)
     stub = gateway({RED: "Mất an toàn lao động", GREEN: "Nghiệm thu"})
 
-    code = main(["run", str(root), "--action", "Mất an toàn lao động=PPE_SIMULATION"])
+    code = main(["run", str(root)])
 
     assert code == 0
     assert stub.rejected_auth == 0  # the device token was sent and accepted
-    assert stub.classify_models == ["clef-flash", "clef-flash"]  # confident, so no fallback call
-    assert stub.edit_models == ["seedream-5.0-flash"]  # only the image in the action folder
+    assert stub.classify_models == ["clef-flash"] * 4  # 2 folder decisions + 2 independent PPE screens
+    assert stub.edit_models == ["seedream-5.0-flash"]  # only the PPE-missing image is edited
     assert (root / "Mất an toàn lao động" / "red.jpg").exists()
     assert (root / "Nghiệm thu" / "green.jpg").exists()
     output = root / "Mất an toàn lao động" / "red_AI_PPE.png"
