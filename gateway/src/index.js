@@ -64,9 +64,13 @@ async function classify(body, env) {
         : String(choice.label || choice.id);
   }
 
-  const selector = body.model === "clef" ? "clef" : "clef-flash";
-  const modelId =
-    selector === "clef" ? "@cf/cloudflare/clef" : "@cf/cloudflare/clef-flash";
+  const allowedModels = new Set(["clef-flash", "clef", "clef-omni"]);
+  const selector = allowedModels.has(body.model) ? body.model : "clef-flash";
+  const modelId = {
+    "clef-flash": "@cf/cloudflare/clef-flash",
+    "clef": "@cf/cloudflare/clef",
+    "clef-omni": "@cf/cloudflare/clef-omni",
+  }[selector];
 
   const response = await env.AI.run(modelId, {
     model: selector,
