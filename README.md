@@ -41,7 +41,16 @@ imageflow ui                     # cửa sổ desktop
 ```
 
 Các biến tùy chọn: `IMAGEFLOW_CLASSIFY_CONCURRENCY` (mặc định 4),
-`IMAGEFLOW_EDIT_CONCURRENCY` (mặc định 2).
+`IMAGEFLOW_EDIT_CONCURRENCY` (mặc định 2). Giá trị sai (không phải số nguyên, nhỏ hơn 1) hoặc
+địa chỉ gateway dùng `http://` từ xa sẽ báo lỗi rõ ràng và thoát với mã 2, không in traceback.
+
+`--action "<tên thư mục>=PPE_SIMULATION"` được **lưu cùng job** và giữ nguyên cho các lần chạy
+sau. Muốn tắt, dùng `--action "<tên thư mục>="`. Tên thư mục không tồn tại, hoặc thư mục đã bị
+xóa, bị từ chối thay vì lặng lẽ ghi vào một bản ghi cũ.
+
+Mã thoát của `imageflow run`: `0` xong hẳn; `1` đã chạy xong nhưng còn ảnh cần chạy lại
+(mất kết nối, ảnh minh họa lỗi); `2` không chạy được hoặc bị dừng (sai cấu hình, thư mục không
+tồn tại, token bị thu hồi, máy chủ không kết nối được).
 
 Khóa API của nhà cung cấp **không** nằm trong ứng dụng. Ứng dụng chỉ có token thiết bị
 và gọi qua gateway.
@@ -61,7 +70,12 @@ scan → normalize → classify (clef-flash, fallback clef) → route → action
 - Đổi tên thư mục giữ nguyên ID và action. Thư mục biến mất được đánh dấu `MISSING`,
   action không bị chuyển sang thư mục khác.
 - Ảnh review: bản sao nằm ở `.imageflow/review/`, ảnh gốc vẫn ở root cho đến khi người
-  dùng chọn thư mục.
+  dùng chọn thư mục. Nếu thư mục đích biến mất đúng lúc chuyển, ảnh quay lại danh sách review;
+  nếu tệp đang bị chương trình khác khóa, lần chạy sau sẽ thử lại.
+- Nếu máy chủ không kết nối được cho 5 ảnh liên tiếp, job dừng ngay thay vì thử lại từng ảnh.
+  Lỗi mạng không gọi model dự phòng vì cùng đi qua một gateway. Ảnh chưa xử lý vẫn nguyên.
+- Ảnh bị cắt dở (copy gián đoạn) được đánh dấu lỗi một lần. Ảnh AI bị cắt dở bị loại bỏ,
+  không bao giờ vào thư mục của người dùng.
 
 ## An toàn khi mất điện hoặc crash
 
@@ -110,6 +124,10 @@ pytest
 category, action theo gán thủ công, bảo toàn ảnh gốc, ảnh confidence thấp không được
 route, phục hồi sau crash, rename thư mục, thay model, thay editor.
 `tests/test_end_to_end.py` chạy toàn bộ luồng qua HTTP với một gateway giả lập cục bộ.
+`tests/test_review_fixes.py` giữ các lỗi đã tìm thấy khi review (ảnh cắt dở, gateway trả lời
+đứt đoạn, chuyển hướng, nhận diện thư mục, giới hạn đồng thời, dừng khi mất kết nối).
+`tests/test_cli.py` kiểm tra thông báo lỗi và mã thoát. `tests/test_controller.py` và
+`tests/test_window_logic.py` kiểm tra logic cửa sổ không cần màn hình (xem bên dưới).
 Không có lệnh gọi mạng ra nhà cung cấp nào trong bộ test.
 
 ## Chưa làm / cần lưu ý
@@ -119,10 +137,18 @@ Không có lệnh gọi mạng ra nhà cung cấp nào trong bộ test.
   thực tế trước khi dùng production.
 - **Đóng gói Windows (.exe/installer) chưa làm.** Không kiểm chứng được trong môi trường
   hiện tại. Cần build trên Windows.
-- **Giao diện Tk chưa được chạy thử.** Môi trường không có tkinter. Chỉ kiểm tra biên dịch
-  và phần chữ (`imageflow/ui/texts.py`) bằng test. Cần chạy thử thủ công trên Windows.
+- **Giao diện Tk chưa được chạy thử trên màn hình thật.** Môi trường không có tkinter.
+  Mọi quyết định của cửa sổ nằm trong `imageflow/ui/controller.py` (có test). Phần vẽ được
+  kiểm tra bằng một bản tkinter giả (`tests/fake_tk.py`): bấm nút, chạy vòng lặp, đọc chữ trên
+  màn hình. Cách này không kiểm tra được bố cục, cỡ chữ hay hành vi riêng của Tk trên Windows,
+  nên vẫn cần chạy thử bằng mắt.
+- **Nhận diện đổi tên thư mục trên Windows chưa kiểm chứng.** Mã lấy device/file index bằng
+  `os.stat` (không dùng `DirEntry.stat`, vốn trả về 0 trên Windows). Việc đó dựa trên tài liệu
+  của Python, chưa chạy trên Windows.
 - Chưa có kéo-thả thư mục vào cửa sổ. Hiện chỉ có nút chọn thư mục.
-- Chưa có khóa đa tiến trình. Không chạy hai job trên cùng một thư mục cùng lúc.
+- Chưa có khóa đa tiến trình. Không chạy hai job (hai cửa sổ, hoặc cửa sổ và dòng lệnh) trên
+  cùng một thư mục cùng lúc. Trong một cửa sổ, các thao tác được xếp hàng tuần tự nên bấm đúp
+  không gây lỗi.
 - Nhận diện đổi tên dựa trên inode/file index. Trên một số hệ thống file tái sử dụng ID
   ngay sau khi xóa, một thư mục xóa rồi tạo lại cùng tên có thể kế thừa mapping cũ.
 - Thư mục `.imageflow/outputs/` đã được tạo nhưng chưa dùng.

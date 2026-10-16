@@ -6,8 +6,6 @@ import asyncio
 import json
 import os
 import socket
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 
 import pytest
@@ -26,7 +24,7 @@ from imageflow.infrastructure.gateway import GatewayClient
 from imageflow.infrastructure.retries import RetryPolicy, backoff_delay, retry_async
 from imageflow.preprocessing.image_loader import EncodedImage, normalize_file
 
-from support import RED, GREEN, no_sleep, write_image
+from support import GREEN, RED, json_handler, no_sleep, serve, write_image
 
 
 # ----- retries ---------------------------------------------------------------
@@ -89,28 +87,8 @@ def test_backoff_is_exponential_with_equal_jitter_and_a_cap():
 @pytest.fixture
 def gateway_server():
     responses: dict[str, tuple[int, dict, bytes]] = {}
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            self.rfile.read(int(self.headers.get("Content-Length", 0)))
-            status, headers, body = responses[self.path]
-            self.send_response(status)
-            for key, value in headers.items():
-                self.send_header(key, value)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *args):
-            return
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        yield responses, f"http://127.0.0.1:{server.server_address[1]}"
-    finally:
-        server.shutdown()
-        server.server_close()
+    with serve(json_handler(responses)) as base:
+        yield responses, base
 
 
 def _post(base: str, path: str = "/v1/classify") -> dict:

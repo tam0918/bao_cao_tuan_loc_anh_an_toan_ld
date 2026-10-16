@@ -1,31 +1,34 @@
 """End to end through the real composition root, gateway client, and provider classes.
 
-A local HTTP stub plays the gateway. It checks the device token, decides by colour, and
-returns an edited PNG, so the JSON contract is exercised for real. No vendor is contacted.
+A local HTTP stub plays the gateway. It checks the device token, then hands each request to the
+same fakes the unit tests use (ScriptedClassifier, MockEditor), so the JSON contract is exercised
+for real and the fakes cannot drift apart. No vendor is contacted.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextlib
 import json
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from io import BytesIO
+from http.server import BaseHTTPRequestHandler
 
 import pytest
-from PIL import Image, ImageDraw
 
 from imageflow.app import ENV_DEVICE_TOKEN, ENV_GATEWAY_URL, main
+from imageflow.classifiers.base import Choice
 from imageflow.core.hashing import sha256_file
-from imageflow.preprocessing.image_loader import is_decodable
-from support import GREEN, RED, nearest, write_image
+from imageflow.preprocessing.image_loader import EncodedImage, is_decodable
+
+from support import GREEN, RED, MockEditor, ScriptedClassifier, folder_files, routed_to, serve, write_image
 
 TOKEN = "dev-token-123"
 
 
 class GatewayStub:
     def __init__(self, palette: dict[tuple[int, int, int], str]) -> None:
-        self.palette = palette
+        self.classifier = ScriptedClassifier(routed_to(palette))  # decides by colour, like the unit tests
+        self.editor = MockEditor()
         self.classify_models: list[str] = []
         self.edit_models: list[str] = []
         self.rejected_auth = 0
@@ -39,23 +42,20 @@ class GatewayStub:
                     stub.rejected_auth += 1
                     return self._send(401, {"error": {"code": "AUTH_FAILED"}})
                 payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                raw = base64.b64decode(payload["image"]["data_b64"])
-                with Image.open(BytesIO(raw)) as img:
-                    colour = img.convert("RGB").getpixel((img.width // 2, img.height // 2))
+                image = EncodedImage(data=base64.b64decode(payload["image"]["data_b64"]), mime=payload["image"]["mime"])
                 if self.path == "/v1/classify":
                     stub.classify_models.append(payload["model"])
-                    label = nearest(colour, stub.palette)  # the palette maps colour -> folder name
-                    probs = {c["id"]: (0.95 if c["label"] == label else 0.025) for c in payload["choices"]}
-                    winner = max(probs, key=probs.__getitem__)
-                    return self._send(200, {"choice_id": winner, "confidence": probs[winner], "probabilities": probs, "model": payload["model"]})
+                    choices = [Choice(c["id"], c["label"], c["description"]) for c in payload["choices"]]
+                    result = asyncio.run(stub.classifier.classify(image, choices))
+                    return self._send(
+                        200,
+                        {"choice_id": result.choice_id, "confidence": result.confidence, "probabilities": result.probabilities, "model": payload["model"]},
+                    )
                 if self.path == "/v1/edit":
                     stub.edit_models.append(payload["model"])
-                    img = Image.open(BytesIO(raw)).convert("RGB")
-                    ImageDraw.Draw(img).rectangle([4, 4, 20, 20], fill=(255, 255, 0))
-                    out = BytesIO()
-                    img.save(out, format="PNG")
-                    data = {"image": {"mime": "image/png", "data_b64": base64.b64encode(out.getvalue()).decode()}, "model": payload["model"]}
-                    return self._send(200, data)
+                    result = asyncio.run(stub.editor.edit(image, payload["instruction"], payload["metadata"]))
+                    edited = {"mime": result.image.mime, "data_b64": base64.b64encode(result.image.data).decode()}
+                    return self._send(200, {"image": edited, "model": payload["model"]})
                 return self._send(404, {"error": {"code": "INVALID_REQUEST"}})
 
             def _send(self, status, body):
@@ -74,22 +74,16 @@ class GatewayStub:
 
 @pytest.fixture
 def gateway(monkeypatch):
-    holder: dict[str, GatewayStub] = {}
+    with contextlib.ExitStack() as servers:
 
-    def start(palette):
-        stub = GatewayStub(palette)
-        server = ThreadingHTTPServer(("127.0.0.1", 0), stub.handler())
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        monkeypatch.setenv(ENV_GATEWAY_URL, f"http://127.0.0.1:{server.server_address[1]}")
-        monkeypatch.setenv(ENV_DEVICE_TOKEN, TOKEN)
-        holder["server"] = server
-        holder["stub"] = stub
-        return stub
+        def start(palette):
+            stub = GatewayStub(palette)
+            base = servers.enter_context(serve(stub.handler()))
+            monkeypatch.setenv(ENV_GATEWAY_URL, base)
+            monkeypatch.setenv(ENV_DEVICE_TOKEN, TOKEN)
+            return stub
 
-    yield start
-    if "server" in holder:
-        holder["server"].shutdown()
-        holder["server"].server_close()
+        yield start
 
 
 def test_run_routes_and_acts_through_the_gateway(tmp_path, gateway, capsys):
@@ -129,7 +123,7 @@ def test_wrong_device_token_stops_the_job_without_moving_anything(tmp_path, gate
     assert code == 2  # the job is aborted with a clear error, not a traceback
     assert stub.rejected_auth >= 1
     assert (root / "red.jpg").exists()
-    assert (root / "Khu").exists() and not any((root / "Khu").iterdir())
+    assert folder_files(root, "Khu") == []
 
 
 def test_missing_configuration_is_reported_not_crashed(tmp_path, monkeypatch, capsys):

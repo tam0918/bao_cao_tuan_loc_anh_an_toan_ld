@@ -88,6 +88,11 @@ class JobReport:
     totals: dict[str, int] = field(default_factory=dict)  # counts over the whole manifest
     metrics: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def unfinished(self) -> int:
+        """Images that another run could still finish: deferred, errored, or with a failed action."""
+        return self.deferred + self.internal_errors + self.totals.get("action_failed", 0)
+
 
 class ImageFlowJob:
     def __init__(

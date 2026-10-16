@@ -1,7 +1,8 @@
 """Composition root and command line (spec sections 8, 33, 35).
 
-This is the only module that names concrete vendor models. Everything else depends on the
-provider interfaces, so a model can be swapped here without touching the pipeline.
+app.py decides which providers and models are wired together. Vendor-specific code lives only in
+classifiers/clef.py, image_editors/seedream.py and infrastructure/gateway.py. The pipeline depends
+on the provider interfaces alone, so a model can be swapped here without touching it.
 """
 
 from __future__ import annotations
@@ -17,9 +18,9 @@ from pathlib import Path
 
 from .actions.base import ActionRegistry
 from .actions.ppe_simulation import PpeSimulationAction
-from .classifiers.clef import ClefClassifierProvider
+from .classifiers.clef import FALLBACK_MODEL, ClefClassifierProvider
 from .core.classification import ClassificationEngine
-from .core.pipeline import ImageFlowJob, JobAborted, PipelineConfig
+from .core.pipeline import ImageFlowJob, JobAborted, JobReport, PipelineConfig, UnknownFolder
 from .core.workspace import scan_workspace
 from .image_editors.seedream import Seedream5FlashProvider
 from .infrastructure.gateway import GatewayClient
@@ -29,12 +30,14 @@ ENV_DEVICE_TOKEN = "IMAGEFLOW_DEVICE_TOKEN"
 ENV_CLASSIFY_CONCURRENCY = "IMAGEFLOW_CLASSIFY_CONCURRENCY"
 ENV_EDIT_CONCURRENCY = "IMAGEFLOW_EDIT_CONCURRENCY"
 
-PRIMARY_CLASSIFIER_MODEL = "clef-flash"
-FALLBACK_CLASSIFIER_MODEL = "clef"
-EDIT_MODEL = "seedream-5.0-flash"
+# Suffixes of derived outputs, so `scan` agrees with the pipeline about what counts as an unclassified
+# image. A test checks this against the registry that build_job assembles.
+ACTION_CLASSES = (PpeSimulationAction,)
+KNOWN_OUTPUT_SUFFIXES = frozenset(cls.output_suffix for cls in ACTION_CLASSES)
 
-# Suffixes of derived outputs. The scanner never treats these as unclassified images.
-KNOWN_OUTPUT_SUFFIXES = frozenset({PpeSimulationAction.output_suffix})
+EXIT_OK = 0
+EXIT_INCOMPLETE = 1  # the run finished but some images still need another run
+EXIT_ERROR = 2  # the run could not start, or was stopped
 
 
 class ConfigError(RuntimeError):
@@ -46,14 +49,20 @@ def gateway_from_env(env: Mapping[str, str]) -> GatewayClient:
     token = env.get(ENV_DEVICE_TOKEN, "").strip()
     if not url or not token:
         raise ConfigError(f"set {ENV_GATEWAY_URL} and {ENV_DEVICE_TOKEN} before running a job")
-    return GatewayClient(url, token)
+    try:
+        return GatewayClient(url, token)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     raw = env.get(name, "").strip()
     if not raw:
         return default
-    value = int(raw)
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError(f"{name} must be a whole number, got {raw!r}") from None
     if value < 1:
         raise ConfigError(f"{name} must be at least 1")
     return value
@@ -62,27 +71,42 @@ def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
 def build_job(root: Path, env: Mapping[str, str] = os.environ, job_id: str | None = None) -> ImageFlowJob:
     gateway = gateway_from_env(env)
     classifier = ClassificationEngine(
-        ClefClassifierProvider(gateway, PRIMARY_CLASSIFIER_MODEL),
-        ClefClassifierProvider(gateway, FALLBACK_CLASSIFIER_MODEL),
+        ClefClassifierProvider(gateway),  # each provider module owns its default model name
+        ClefClassifierProvider(gateway, FALLBACK_MODEL),
     )
     actions = ActionRegistry()
-    actions.register(PpeSimulationAction(Seedream5FlashProvider(gateway, EDIT_MODEL)))
-    config = PipelineConfig(
-        classify_concurrency=_positive_int(env, ENV_CLASSIFY_CONCURRENCY, 4),
-        edit_concurrency=_positive_int(env, ENV_EDIT_CONCURRENCY, 2),
+    actions.register(PpeSimulationAction(Seedream5FlashProvider(gateway)))
+    defaults = PipelineConfig()
+    config = dataclasses.replace(
+        defaults,
+        classify_concurrency=_positive_int(env, ENV_CLASSIFY_CONCURRENCY, defaults.classify_concurrency),
+        edit_concurrency=_positive_int(env, ENV_EDIT_CONCURRENCY, defaults.edit_concurrency),
     )
     return ImageFlowJob(root, classifier, actions, config=config, job_id=job_id)
 
 
+def require_directory(folder: Path) -> Path:
+    """The resolved workspace path, or a ConfigError. Checked before anything is created under it."""
+    resolved = folder.expanduser().resolve()
+    if not resolved.is_dir():
+        raise ConfigError(f"not a folder: {folder}")
+    return resolved
+
+
+def exit_code_for(report: JobReport) -> int:
+    """EXIT_INCOMPLETE when images were left for a retry, so a script can tell a clean run from a partial one."""
+    return EXIT_INCOMPLETE if report.unfinished else EXIT_OK
+
+
 def _cmd_scan(folder: Path) -> int:
-    scan = scan_workspace(folder.resolve(), KNOWN_OUTPUT_SUFFIXES)
+    scan = scan_workspace(require_directory(folder), KNOWN_OUTPUT_SUFFIXES)
     summary = {
         "images": len(scan.images),
         "folders": [f.name for f in scan.folders],
         "unsupported": scan.unsupported,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0
+    return EXIT_OK
 
 
 def _parse_assignment(text: str) -> tuple[str, list[str]]:
@@ -94,17 +118,26 @@ def _parse_assignment(text: str) -> tuple[str, list[str]]:
 
 
 def _cmd_run(folder: Path, assignments: list[str]) -> int:
-    job = build_job(folder.resolve(), os.environ)
+    root = require_directory(folder)
+    parsed = [_parse_assignment(text) for text in assignments]
+    job = build_job(root, os.environ)
     job.prepare()
-    by_name = {f["name"]: f["folder_id"] for f in job.project.folders}
-    for text in assignments:
-        name, actions = _parse_assignment(text)
-        if name not in by_name:
-            raise ConfigError(f"no folder named {name!r} in the workspace")
-        job.set_actions(by_name[name], actions)
-    report = asyncio.run(job.run())
+    known = job.actions.known_types()
+    for name, actions in parsed:
+        unknown = sorted(set(actions) - known)
+        if unknown:
+            raise ConfigError(f"unknown action {unknown}; available: {sorted(known)}")
+        try:
+            folder_id = job.resolve_folder(name)
+        except UnknownFolder:
+            raise ConfigError(f"no folder named {name!r} in the workspace") from None
+        job.set_actions(folder_id, actions)
+    report = asyncio.run(job.run(refresh=False))  # prepare() just ran, so skip scanning twice
     print(json.dumps(dataclasses.asdict(report), ensure_ascii=False, indent=2, default=str))
-    return 0
+    code = exit_code_for(report)
+    if code != EXIT_OK:
+        print(f"imageflow: {report.unfinished} image(s) could not be processed yet; run again to retry", file=sys.stderr)
+    return code
 
 
 def _cmd_ui() -> int:
@@ -113,10 +146,22 @@ def _cmd_ui() -> int:
     except ImportError as exc:  # tkinter is not installed on some Python builds
         raise ConfigError(f"the desktop window needs tkinter: {exc}") from exc
     launch()
-    return 0
+    return EXIT_OK
+
+
+def _use_utf8_output() -> None:
+    """Folder names are Vietnamese. A redirected Windows console would otherwise raise on print."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:
+    _use_utf8_output()
     parser = argparse.ArgumentParser(prog="imageflow", description="Classify job photos into your folders, then run folder actions.")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -130,7 +175,8 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         metavar="FOLDER=ACTION[,ACTION]",
-        help='assign actions to a folder for this run, e.g. "<folder name>=PPE_SIMULATION"',
+        help="assign actions to a folder. The assignment is saved with the job and stays until changed; "
+        'use "<folder name>=" to clear it',
     )
 
     sub.add_parser("ui", help="open the desktop window")
@@ -144,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_ui()
     except (ConfigError, JobAborted) as exc:
         print(f"imageflow: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_ERROR
 
 
 if __name__ == "__main__":

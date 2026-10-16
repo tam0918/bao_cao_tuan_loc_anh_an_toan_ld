@@ -16,6 +16,7 @@ from .base import Choice, ClassificationResult, ClassifierProvider
 
 CLASSIFY_PATH = "/v1/classify"
 DEFAULT_MODEL = "clef-flash"
+FALLBACK_MODEL = "clef"  # asked when DEFAULT_MODEL is not confident enough
 
 
 class ClefClassifierProvider(ClassifierProvider):
