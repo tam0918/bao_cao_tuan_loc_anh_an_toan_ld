@@ -58,15 +58,25 @@ và gọi qua gateway.
 ## Quy trình xử lý
 
 ```
-scan → normalize → classify (clef-flash, fallback clef) → route → action → complete
-                         │
+scan → normalize → classify (clef-omni, fallback clef-flash) → route → screen PPE → action → complete
+                         │                                                    │
+                         │                                                    └─ không xác định được → tính vào "nên xem lại"
                          └─ không đủ tự tin → REVIEW_REQUIRED → người dùng chọn thư mục
 ```
+
+Bước 1 chọn **thư mục của người dùng**. Bước 2 (`imageflow/core/safety.py`) là một quyết định
+riêng, không thuộc taxonomy: mỗi ảnh đã vào thư mục được hỏi lại "đủ PPE / thiếu PPE / không rõ".
+Chỉ ảnh **thiếu PPE** mới đến model tạo ảnh (Seedream). Ảnh "không rõ" không bị đoán: được đếm
+vào `safety_review_required` và hiện trên màn hình hoàn tất.
 
 - Tự động route khi `top1 ≥ 0.85` **và** `top1 − top2 ≥ 0.15`. Không đạt thì thử model
   fallback, vẫn không đạt thì đưa vào review. Hệ thống không đoán.
 - Mỗi ảnh chỉ vào **một** thư mục (single-label).
-- Action chỉ chạy trên thư mục mà người dùng đã gán. Tên thư mục không quyết định gì.
+- Khi bật sàng lọc PPE tự động (mặc định trong `app.build_job`), việc ảnh nào được tạo ảnh
+  minh họa do bước 2 quyết định, không phụ thuộc thư mục, nên cửa sổ không còn ô chọn theo
+  thư mục. Khi tắt sàng lọc, action chỉ chạy trên thư mục mà người dùng đã gán, và tên thư
+  mục không quyết định gì.
+- Hai ảnh trùng nội dung là hai ảnh riêng (mỗi ảnh có `image_id` riêng), cùng được xử lý.
 - Đổi tên thư mục giữ nguyên ID và action. Thư mục biến mất được đánh dấu `MISSING`,
   action không bị chuyển sang thư mục khác.
 - Ảnh review: bản sao nằm ở `.imageflow/review/`, ảnh gốc vẫn ở root cho đến khi người
@@ -93,14 +103,14 @@ JSON. Gateway giữ khóa Cloudflare và Seedream, cũng như tên model thật.
 
 ```json
 {
-  "model": "clef-flash",
+  "model": "clef-omni",
   "image": {"mime": "image/jpeg", "data_b64": "..."},
   "choices": [{"id": "f_8a31", "label": "Mất an toàn lao động", "description": "..."}],
   "question": "Trong các thư mục được cung cấp, ảnh này phù hợp nhất với thư mục nào?"
 }
 ```
 
-Phản hồi: `{"choice_id": "f_8a31", "confidence": 0.94, "probabilities": {"f_8a31": 0.94, ...}, "model": "clef-flash"}`
+Phản hồi: `{"choice_id": "f_8a31", "confidence": 0.94, "probabilities": {"f_8a31": 0.94, ...}, "model": "clef-omni"}`
 
 `POST /v1/edit`
 
@@ -132,9 +142,10 @@ Không có lệnh gọi mạng ra nhà cung cấp nào trong bộ test.
 
 ## Chưa làm / cần lưu ý
 
-- **Gateway (Cloudflare Worker) chưa có trong repo.** Cần triển khai theo hợp đồng ở
-  trên. Đối chiếu tên model `clef-flash`, `clef`, `seedream-5.0-flash` với nhà cung cấp
-  thực tế trước khi dùng production.
+- **Gateway nằm ở `gateway/`** (Cloudflare Worker, xem `gateway/README.md`). Phần trình
+  bày ở trên là hợp đồng mà ứng dụng này dùng; bộ test chỉ kiểm tra bằng gateway giả lập, chưa
+  chạy với Worker đã triển khai. Đối chiếu tên model `clef-omni`, `clef-flash`,
+  `seedream-5.0-flash` với nhà cung cấp thực tế trước khi dùng production.
 - **Đóng gói Windows (.exe/installer) chưa làm.** Không kiểm chứng được trong môi trường
   hiện tại. Cần build trên Windows.
 - **Giao diện Tk chưa được chạy thử trên màn hình thật.** Môi trường không có tkinter.

@@ -29,6 +29,9 @@ class OpenResult:
     images: int
     unsupported: int
     folders: tuple[FolderRow, ...]
+    # True when every routed photo is screened for missing PPE automatically. A per-folder tick then
+    # has no effect, so the window must not offer one.
+    screening_is_global: bool = False
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,7 @@ def completion_numbers(report: JobReport) -> dict[str, int]:
         "review": totals.get("review_required", 0),
         "pending": report.unfinished,
         "failed": totals.get("failed", 0),
+        "safety_review": report.safety_review_required,
     }
 
 
@@ -79,7 +83,12 @@ class SessionController:
         job = self._factory(root)
         scan = job.prepare()
         self._job, self.root = job, root
-        return OpenResult(images=len(scan.images), unsupported=len(scan.unsupported), folders=tuple(job.folder_rows()))
+        return OpenResult(
+            images=len(scan.images),
+            unsupported=len(scan.unsupported),
+            folders=tuple(job.folder_rows()),
+            screening_is_global=job.safety_screen is not None,
+        )
 
     # ----- background work -------------------------------------------------------------------------
     def start(self, ppe: Mapping[str, bool]) -> None:

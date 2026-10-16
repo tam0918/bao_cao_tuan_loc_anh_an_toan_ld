@@ -97,6 +97,12 @@ def test_an_assignment_is_saved_and_an_empty_one_clears_it(configured, tmp_path)
     assert saved() == []
 
 
+def test_an_action_flag_warns_that_ppe_screening_is_automatic(configured, tmp_path, capsys):
+    root = make_workspace(tmp_path, "Khu")
+    assert main(["run", str(root), "--action", "Khu=PPE_SIMULATION"]) == 0
+    assert "PPE screening is automatic" in capsys.readouterr().err
+
+
 # ----- exit codes ---------------------------------------------------------------------------------------------
 def test_images_left_for_another_run_give_exit_code_1(tmp_path, capsys, monkeypatch):
     root = make_workspace(tmp_path, "Khu")

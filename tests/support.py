@@ -18,6 +18,7 @@ from imageflow.actions.ppe_simulation import PpeSimulationAction
 from imageflow.classifiers.base import Choice, ClassificationResult, ClassifierProvider
 from imageflow.core.classification import ClassificationEngine
 from imageflow.core.pipeline import ImageFlowJob, PipelineConfig
+from imageflow.core.safety import SafetyScreenEngine
 from imageflow.image_editors.base import ImageEditProvider, ImageEditResult
 from imageflow.preprocessing.image_loader import EncodedImage
 
@@ -134,12 +135,17 @@ def build_job(
     *,
     fallback: ClassifierProvider | None = None,
     editor: ImageEditProvider | None = None,
+    safety: ClassifierProvider | None = None,
     job_id: str = "j_test",
 ) -> ImageFlowJob:
+    """``safety`` switches on the second stage: every routed photo is screened for missing PPE."""
+    screen = SafetyScreenEngine(build_engine(safety)) if safety is not None else None
     return ImageFlowJob(
         root,
         build_engine(classifier, fallback),
         build_registry(editor),
+        safety_screen=screen,
+        safety_action_type=PpeSimulationAction.action_type if screen is not None else None,
         config=PipelineConfig(classify_concurrency=3, edit_concurrency=2),
         job_id=job_id,
     )

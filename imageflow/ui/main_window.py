@@ -86,13 +86,16 @@ class ImageFlowWindow(tk.Tk):
         self._ppe_vars = {}
         if not result.folders:
             self._label(texts.NO_FOLDERS)
+        elif result.screening_is_global:
+            self._label(texts.PPE_AUTOMATIC)  # nothing to choose per folder, so no boxes that would do nothing
         for row in result.folders:
             line = ttk.Frame(self._body)
             line.pack(fill="x", pady=4)
             ttk.Label(line, text=row.name, width=28).pack(side="left")
-            ticked = tk.BooleanVar(value=PPE_ACTION in row.actions)  # show what was saved, never reset it silently
-            ttk.Checkbutton(line, text=texts.PPE_ACTION_LABEL, variable=ticked).pack(side="left")
-            self._ppe_vars[row.folder_id] = ticked
+            if not result.screening_is_global:
+                ticked = tk.BooleanVar(value=PPE_ACTION in row.actions)  # show what was saved, never reset it silently
+                ttk.Checkbutton(line, text=texts.PPE_ACTION_LABEL, variable=ticked).pack(side="left")
+                self._ppe_vars[row.folder_id] = ticked
         buttons = ttk.Frame(self._body)
         buttons.pack(pady=20)
         ttk.Button(buttons, text=texts.BACK, command=self.show_home).pack(side="left", padx=6)

@@ -17,7 +17,10 @@ from imageflow.errors import TransientError
 from imageflow.ui import texts
 from imageflow.ui.controller import SessionController
 
+from imageflow.core.safety import PPE_NEEDS_EDIT, PPE_OK, PPE_UNCLEAR
+
 from support import (
+    BLUE,
     GREEN,
     RED,
     FailingClassifier,
@@ -25,6 +28,8 @@ from support import (
     ScriptedClassifier,
     build_job,
     folder_files,
+    nearest,
+    peaked,
     routed_to,
     write_image,
 )
@@ -46,6 +51,13 @@ def ui(monkeypatch):
     for window in windows:
         window._controller.close()
     sys.modules.pop("imageflow.ui.main_window", None)
+
+
+def ppe_verdicts(by_colour):
+    def decide(colour, choices):
+        return peaked(choices, nearest(colour, by_colour))
+
+    return decide
 
 
 def screen_text(window) -> str:
@@ -154,6 +166,23 @@ def test_a_folder_renamed_after_the_window_opened_does_not_break_start(ui, tmp_p
 
     assert ui.messagebox.calls == []
     assert (root / "Khu B" / "red_AI_PPE.png").exists()
+
+
+# ----- automatic PPE screening -------------------------------------------------------------------------------
+def test_with_automatic_screening_there_are_no_boxes_that_would_do_nothing(ui, tmp_path):
+    root = workspace(tmp_path, images=((RED, "missing.jpg"), (GREEN, "fine.jpg"), (BLUE, "unclear.jpg")))
+    folders = ScriptedClassifier(routed_to({RED: "Khu", GREEN: "Khu", BLUE: "Khu"}))
+    screen = ScriptedClassifier(ppe_verdicts({RED: PPE_NEEDS_EDIT, GREEN: PPE_OK, BLUE: PPE_UNCLEAR}))
+    window = ui.make(lambda r: build_job(r, folders, editor=MockEditor(), safety=screen))
+
+    window.open_folder(root)
+
+    assert not [w for w in window._body.walk() if isinstance(w, fake_tk.Checkbutton)]
+    assert texts.PPE_AUTOMATIC in screen_text(window)
+    run_to_the_end(window)
+    assert "1 ảnh được tạo minh họa PPE" in screen_text(window)
+    assert "1 ảnh chưa xác định được PPE, nên xem lại" in screen_text(window)  # not silently treated as fine
+    assert (root / "Khu" / "missing_AI_PPE.png").exists()
 
 
 # ----- the completion screen is honest -----------------------------------------------------------------------

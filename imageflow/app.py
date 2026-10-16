@@ -21,6 +21,7 @@ from .actions.ppe_simulation import PpeSimulationAction
 from .classifiers.clef import FALLBACK_MODEL, ClefClassifierProvider
 from .core.classification import ClassificationEngine
 from .core.pipeline import ImageFlowJob, JobAborted, JobReport, PipelineConfig, UnknownFolder
+from .core.safety import SafetyScreenEngine
 from .core.workspace import scan_workspace
 from .image_editors.seedream import Seedream5FlashProvider
 from .infrastructure.gateway import GatewayClient
@@ -68,12 +69,13 @@ def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
+def _classifier_engine(gateway: GatewayClient) -> ClassificationEngine:
+    """A primary model and a stronger fallback. Each provider module owns its default model name."""
+    return ClassificationEngine(ClefClassifierProvider(gateway), ClefClassifierProvider(gateway, FALLBACK_MODEL))
+
+
 def build_job(root: Path, env: Mapping[str, str] = os.environ, job_id: str | None = None) -> ImageFlowJob:
     gateway = gateway_from_env(env)
-    classifier = ClassificationEngine(
-        ClefClassifierProvider(gateway),  # each provider module owns its default model name
-        ClefClassifierProvider(gateway, FALLBACK_MODEL),
-    )
     actions = ActionRegistry()
     actions.register(PpeSimulationAction(Seedream5FlashProvider(gateway)))
     defaults = PipelineConfig()
@@ -82,7 +84,15 @@ def build_job(root: Path, env: Mapping[str, str] = os.environ, job_id: str | Non
         classify_concurrency=_positive_int(env, ENV_CLASSIFY_CONCURRENCY, defaults.classify_concurrency),
         edit_concurrency=_positive_int(env, ENV_EDIT_CONCURRENCY, defaults.edit_concurrency),
     )
-    return ImageFlowJob(root, classifier, actions, config=config, job_id=job_id)
+    return ImageFlowJob(
+        root,
+        _classifier_engine(gateway),  # stage 1: which of the user's folders
+        actions,
+        safety_screen=SafetyScreenEngine(_classifier_engine(gateway)),  # stage 2: does the photo need a PPE illustration
+        safety_action_type=PpeSimulationAction.action_type,
+        config=config,
+        job_id=job_id,
+    )
 
 
 def require_directory(folder: Path) -> Path:
@@ -132,6 +142,8 @@ def _cmd_run(folder: Path, assignments: list[str]) -> int:
         except UnknownFolder:
             raise ConfigError(f"no folder named {name!r} in the workspace") from None
         job.set_actions(folder_id, actions)
+    if parsed and job.safety_screen is not None:
+        print("imageflow: note: PPE screening is automatic, so --action does not choose which photos get an illustration", file=sys.stderr)
     report = asyncio.run(job.run(refresh=False))  # prepare() just ran, so skip scanning twice
     print(json.dumps(dataclasses.asdict(report), ensure_ascii=False, indent=2, default=str))
     code = exit_code_for(report)

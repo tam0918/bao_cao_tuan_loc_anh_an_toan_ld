@@ -20,14 +20,21 @@ from imageflow.classifiers.base import Choice
 from imageflow.core.hashing import sha256_file
 from imageflow.preprocessing.image_loader import EncodedImage, is_decodable
 
-from support import GREEN, RED, MockEditor, ScriptedClassifier, folder_files, routed_to, serve, write_image
+from support import GREEN, RED, MockEditor, ScriptedClassifier, folder_files, nearest, peaked, routed_to, serve, write_image
 
 TOKEN = "dev-token-123"
 
 
+def ppe_decision(colour, choices):
+    """In these photos the red one shows a worker without PPE and the green one a compliant worker."""
+    missing = nearest(colour, {RED: True, GREEN: False})
+    return peaked(choices, "ppe_needs_edit" if missing else "ppe_ok")
+
+
 class GatewayStub:
     def __init__(self, palette: dict[tuple[int, int, int], str]) -> None:
-        self.classifier = ScriptedClassifier(routed_to(palette))  # decides by colour, like the unit tests
+        self.classifier = ScriptedClassifier(routed_to(palette))  # stage 1 decides the folder by colour
+        self.screen = ScriptedClassifier(ppe_decision)  # stage 2 decides whether the photo needs a PPE illustration
         self.editor = MockEditor()
         self.classify_models: list[str] = []
         self.edit_models: list[str] = []
@@ -46,7 +53,8 @@ class GatewayStub:
                 if self.path == "/v1/classify":
                     stub.classify_models.append(payload["model"])
                     choices = [Choice(c["id"], c["label"], c["description"]) for c in payload["choices"]]
-                    result = asyncio.run(stub.classifier.classify(image, choices))
+                    screening = any(c.choice_id == "ppe_needs_edit" for c in choices)  # stage 2 asks about PPE, not folders
+                    result = asyncio.run((stub.screen if screening else stub.classifier).classify(image, choices))
                     return self._send(
                         200,
                         {"choice_id": result.choice_id, "confidence": result.confidence, "probabilities": result.probabilities, "model": payload["model"]},
@@ -94,12 +102,12 @@ def test_run_routes_and_acts_through_the_gateway(tmp_path, gateway, capsys):
     write_image(root / "green.jpg", GREEN)
     stub = gateway({RED: "Mất an toàn lao động", GREEN: "Nghiệm thu"})
 
-    code = main(["run", str(root), "--action", "Mất an toàn lao động=PPE_SIMULATION"])
+    code = main(["run", str(root)])
 
     assert code == 0
     assert stub.rejected_auth == 0  # the device token was sent and accepted
-    assert stub.classify_models == ["clef-flash", "clef-flash"]  # confident, so no fallback call
-    assert stub.edit_models == ["seedream-5.0-flash"]  # only the image in the action folder
+    assert stub.classify_models == ["clef-omni"] * 4  # Omni is primary for both folder routing and PPE screening
+    assert stub.edit_models == ["seedream-5.0-flash"]  # only the PPE-missing image is edited
     assert (root / "Mất an toàn lao động" / "red.jpg").exists()
     assert (root / "Nghiệm thu" / "green.jpg").exists()
     output = root / "Mất an toàn lao động" / "red_AI_PPE.png"

@@ -1,6 +1,6 @@
 """Clef classifier provider (spec section 12).
 
-Talks to the gateway's classify route. The model name (``clef-flash`` by default, ``clef``
+Talks to the gateway's classify route. The model name (``clef-omni`` by default, ``clef-flash``
 for fallback) is configuration. The gateway maps it to the upstream model.
 """
 
@@ -15,8 +15,8 @@ from ..preprocessing.image_loader import EncodedImage
 from .base import Choice, ClassificationResult, ClassifierProvider
 
 CLASSIFY_PATH = "/v1/classify"
-DEFAULT_MODEL = "clef-flash"
-FALLBACK_MODEL = "clef"  # asked when DEFAULT_MODEL is not confident enough
+DEFAULT_MODEL = "clef-omni"
+FALLBACK_MODEL = "clef-flash"  # asked when DEFAULT_MODEL is not confident enough
 
 
 class ClefClassifierProvider(ClassifierProvider):

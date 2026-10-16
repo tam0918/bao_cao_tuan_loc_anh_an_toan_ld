@@ -15,6 +15,7 @@ CHOOSE_FOLDER = "Chọn thư mục"
 BACK = "Quay lại"
 START = "Bắt đầu"
 PPE_ACTION_LABEL = "Tạo ảnh minh họa PPE"
+PPE_AUTOMATIC = "Ảnh có người thiếu mũ hoặc áo bảo hộ sẽ tự được tạo ảnh minh họa PPE."
 PROGRESS = "Đang xử lý, vui lòng chờ..."
 OPEN_FOLDER = "Mở thư mục"
 REVIEW_BUTTON = "Xem ảnh cần kiểm tra"
@@ -46,7 +47,7 @@ def scan_summary(images: int, folders: int, unsupported: int) -> str:
     return "\n".join(lines)
 
 
-def done_summary(classified: int, actioned: int, review: int, pending: int = 0, failed: int = 0) -> str:
+def done_summary(classified: int, actioned: int, review: int, pending: int = 0, failed: int = 0, safety_review: int = 0) -> str:
     """The completion screen. ``pending`` images are waiting for another run, so it must not say 'done'."""
     lines = [
         "Hoàn tất" if not pending else "Chưa hoàn tất",
@@ -59,6 +60,8 @@ def done_summary(classified: int, actioned: int, review: int, pending: int = 0, 
         lines += ["", f"{pending} ảnh chưa xử lý xong, hãy chạy lại để thử tiếp"]
     if failed:
         lines += [f"{failed} ảnh bị lỗi hoặc không đọc được"]
+    if safety_review:
+        lines += [f"{safety_review} ảnh chưa xác định được PPE, nên xem lại"]
     return "\n".join(lines)
 
 

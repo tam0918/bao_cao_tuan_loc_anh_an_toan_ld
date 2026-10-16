@@ -10,6 +10,7 @@ Ordering rules that keep the job crash-safe:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -30,6 +31,7 @@ from .manifest import ManifestStore, atomic_write_bytes
 from .metrics import JobMetrics
 from .project import ProjectStore
 from .routing import DestinationMissing, deterministic_name, plan_recovery, route_file
+from .safety import SafetyScreenEngine
 from .state_machine import RESUMABLE_STATES, ImageState
 from .workspace import ImageFile, ScanResult, choice_description, nfc, scan_workspace
 
@@ -81,6 +83,7 @@ class JobReport:
     actioned: int = 0
     failed: int = 0
     actions_failed: int = 0
+    safety_review_required: int = 0
     deferred: int = 0
     internal_errors: int = 0  # unexpected exceptions, logged and isolated to one image
     unsupported: list[str] = field(default_factory=list)
@@ -100,6 +103,8 @@ class ImageFlowJob:
         root: Path,
         classifier: ClassificationEngine,
         actions: ActionRegistry,
+        safety_screen: SafetyScreenEngine | None = None,
+        safety_action_type: str | None = None,
         config: PipelineConfig = PipelineConfig(),
         job_id: str | None = None,
     ) -> None:
@@ -107,6 +112,8 @@ class ImageFlowJob:
         self.system = self.root / SYSTEM_DIR
         self.classifier = classifier
         self.actions = actions
+        self.safety_screen = safety_screen
+        self.safety_action_type = safety_action_type
         self.config = config
         self.job_id = job_id or f"j_{uuid.uuid4().hex[:10]}"
         self.manifest = ManifestStore(self.system)
@@ -189,7 +196,15 @@ class ImageFlowJob:
                 {"folder_id": c["folder_id"], "name": self._folder_name(c["folder_id"]), "probability": c["probability"]}
                 for c in (rec.get("review") or {}).get("candidates", [])
             ]
-            items.append({"sha256": rec["sha256"], "name": rec["original_filename"], "path": rec["current_rel"], "candidates": candidates})
+            items.append(
+                {
+                    "image_id": rec["image_id"],  # the key to pass to assign(); a content hash may be shared by two photos
+                    "sha256": rec["sha256"],
+                    "name": rec["original_filename"],
+                    "path": rec["current_rel"],
+                    "candidates": candidates,
+                }
+            )
         return items
 
     def set_actions(self, folder_id: str, actions: list[str]) -> None:
@@ -225,7 +240,7 @@ class ImageFlowJob:
         self._finish(started)
         return self.report
 
-    async def assign(self, sha256: str, folder_id: str) -> str | None:
+    async def assign(self, image_id: str, folder_id: str) -> str | None:
         """The user picks the folder for an image in review. It is then routed and actioned like any other.
 
         Returns None when the image was routed and its actions finished. Otherwise it returns a
@@ -237,7 +252,7 @@ class ImageFlowJob:
         * ``SOURCE_MISSING`` / ``LOST_SOURCE``: the original file is gone.
         """
         self.prepare()  # the folder may have been renamed or removed since the last run
-        rec = self.manifest.get(sha256)
+        rec = self.manifest.get(image_id)
         if rec is None or rec["state"] != ImageState.REVIEW_REQUIRED.value:
             raise ValueError("image is not waiting for review")
         if folder_id not in self.project.active_ids():
@@ -251,55 +266,60 @@ class ImageFlowJob:
             "second_choice": None,
             "second_probability": None,
         }
-        self.manifest.transition(sha256, ImageState.CLASSIFIED, classification=classification, last_error=None)
-        if not self._route(sha256):
-            problem = self.manifest.get(sha256)["last_error"] or "ROUTE_FAILED"
-            if self._state(sha256) == ImageState.CLASSIFIED:
+        self.manifest.transition(image_id, ImageState.CLASSIFIED, classification=classification, last_error=None)
+        if not self._route(image_id):
+            problem = self.manifest.get(image_id)["last_error"] or "ROUTE_FAILED"
+            if self._state(image_id) == ImageState.CLASSIFIED:
                 # Nothing was moved, so the image goes back to the review list for another choice.
-                self.manifest.transition(sha256, ImageState.REVIEW_REQUIRED, last_error=problem)
+                self.manifest.transition(image_id, ImageState.REVIEW_REQUIRED, last_error=problem)
             return problem
-        self._remove_review_copy(sha256)  # only after the original has safely left the root
-        await self._run_actions(sha256)
-        return "ACTION_FAILED" if self._state(sha256) == ImageState.ACTION_FAILED else None
+        self._remove_review_copy(image_id)  # only after the original has safely left the root
+        await self._run_actions(image_id)
+        return "ACTION_FAILED" if self._state(image_id) == ImageState.ACTION_FAILED else None
 
     # ----- planning --------------------------------------------------------------
     def _pending(self) -> list[str]:
         assert self._scan is not None
-        seen: set[str] = set()
+        seen_instances: set[str] = set()
         pending: list[str] = []
         for img in sorted(self._scan.images, key=lambda i: i.name):
-            sha = sha256_file(img.path)
-            if sha in seen:
-                self.report.skipped_duplicates += 1  # identical bytes already handled in this run
-                continue
-            seen.add(sha)
-            rec = self.manifest.get(sha)
+            content_sha = sha256_file(img.path)
+            image_id = self._instance_id(img.rel, content_sha)
+            seen_instances.add(image_id)
+            rec = self.manifest.get(image_id)
             if rec is None:
-                self.manifest.put(self._new_record(sha, img))
-                pending.append(sha)
+                self.manifest.put(self._new_record(image_id, content_sha, img))
+                pending.append(image_id)
                 continue
             state = ImageState(rec["state"])
             if state == ImageState.COMPLETE:
-                self.report.skipped_duplicates += 1  # already processed, never duplicated
+                self.report.skipped_duplicates += 1  # this exact file instance was already processed
             elif state in RESUMABLE_STATES:
-                pending.append(sha)
+                pending.append(image_id)
             # REVIEW_REQUIRED waits for the user. FAILED needs a human fix. Neither is re-run here.
         # Images that already left the root (routed, mid-action) still need to finish.
         for rec in self.manifest.all():
-            if rec["sha256"] not in seen and ImageState(rec["state"]) in RESUMABLE_STATES:
-                pending.append(rec["sha256"])
+            if rec["image_id"] not in seen_instances and ImageState(rec["state"]) in RESUMABLE_STATES:
+                pending.append(rec["image_id"])
         return pending
 
-    def _new_record(self, sha: str, img: ImageFile) -> dict[str, Any]:
+    @staticmethod
+    def _instance_id(source_rel: str, content_sha: str) -> str:
+        """Stable identity for one file instance. Content SHA is only a cache/integrity key."""
+        digest = hashlib.sha256((source_rel + "\0" + content_sha).encode("utf-8")).hexdigest()
+        return "im_" + digest[:24]
+
+    def _new_record(self, image_id: str, content_sha: str, img: ImageFile) -> dict[str, Any]:
         return {
-            "image_id": "im_" + sha[:12],
-            "sha256": sha,
+            "image_id": image_id,
+            "sha256": content_sha,
             "original_filename": img.name,
             "source_path": img.rel,
             "current_rel": img.rel,
             "state": ImageState.DISCOVERED.value,
             "normalized_rel": None,
             "classification": None,
+            "safety": None,
             "attempts": [],
             "review": None,
             "review_copy_rel": None,
@@ -336,12 +356,12 @@ class ImageFlowJob:
             self._fail(sha, "SOURCE_MISSING")
             return False
         try:
-            encoded = normalize_file(src, self._dirs["normalized"], sha)
+            encoded = normalize_file(src, self._dirs["normalized"], rec["sha256"])
         except PermanentError as exc:
             self._fail(sha, exc.code)
             return False
         if rec["state"] == ImageState.DISCOVERED.value:
-            normalized_rel = self._rel(self._dirs["normalized"] / f"{sha}.jpg")
+            normalized_rel = self._rel(self._dirs["normalized"] / f"{rec['sha256']}.jpg")
             self.manifest.transition(sha, ImageState.NORMALIZED, normalized_rel=normalized_rel)
         if not choices:
             return False  # no category folder yet. The image waits in NORMALIZED.
@@ -429,7 +449,7 @@ class ImageFlowJob:
         if state == ImageState.ROUTING:
             routing = rec.get("routing") or {}
             planned = self._abs(routing["destination_path"]) if routing.get("destination_path") else None
-            plan = plan_recovery(src, planned, sha, mode)
+            plan = plan_recovery(src, planned, rec["sha256"], mode)
             self._log.emit("route_recovered", sha256=sha, plan=plan.action)
             if plan.action == "LOST_SOURCE":
                 self._fail(sha, "LOST_SOURCE")
@@ -483,23 +503,87 @@ class ImageFlowJob:
         if folder_id not in self.project.active_ids():
             self._note_error(sha, "DESTINATION_MISSING")
             return
-        action_types = self.project.actions_for(folder_id)
+
+        if self.safety_screen is not None:
+            status = await self._ensure_safety(sha)
+            if status is None:
+                return
+            if status == "SAFE":
+                self._set_state(sha, ImageState.COMPLETE)
+                self._log.emit("complete", image_id=sha, folder_id=folder_id, actions=[], ppe_status="SAFE")
+                return
+            if status == "REVIEW":
+                self.report.safety_review_required += 1
+                self._set_state(sha, ImageState.COMPLETE)
+                self._log.emit("complete", image_id=sha, folder_id=folder_id, actions=[], ppe_status="REVIEW")
+                return
+            action_types = [self.safety_action_type] if self.safety_action_type else []
+        else:
+            action_types = self.project.actions_for(folder_id)
+
         if not action_types:
             self._set_state(sha, ImageState.COMPLETE)
-            self._log.emit("complete", sha256=sha, folder_id=folder_id, actions=[])
+            self._log.emit("complete", image_id=sha, folder_id=folder_id, actions=[])
             return
         if self._state(sha) == ImageState.ROUTED:
             self._set_state(sha, ImageState.ACTION_PENDING)
         for atype in action_types:
             existing = _find_action(self.manifest.get(sha)["actions"], atype)
             if existing and existing["status"] == "SUCCESS":
-                continue  # idempotent: an output that already exists is never regenerated
+                continue
             if existing and existing.get("permanent"):
-                return  # needs a human fix, not another retry
+                return
             if not await self._run_action(sha, atype, folder_id):
                 return
         self._set_state(sha, ImageState.COMPLETE)
-        self._log.emit("complete", sha256=sha, folder_id=folder_id, actions=action_types)
+        self._log.emit("complete", image_id=sha, folder_id=folder_id, actions=action_types)
+
+    async def _ensure_safety(self, sha: str) -> str | None:
+        rec = self.manifest.get(sha)
+        previous = rec.get("safety") or {}
+        if previous.get("status") in {"SAFE", "NEEDS_EDIT", "REVIEW"}:
+            return previous["status"]
+
+        src = self._abs(rec["current_rel"])
+        if not src.exists():
+            self._fail(sha, "SOURCE_MISSING")
+            return None
+        try:
+            encoded = normalize_file(src, self._dirs["normalized"], rec["sha256"])
+        except PermanentError as exc:
+            self._fail(sha, exc.code)
+            return None
+
+        try:
+            async with self._limit("classify"):
+                decision = await self.safety_screen.decide(encoded)
+        except ClassifierUnavailable:
+            self._note_error(sha, "SAFETY_CLASSIFIER_UNAVAILABLE")
+            self.report.deferred += 1
+            return None
+        except PermanentError as exc:
+            if exc.code == "AUTH_FAILED":
+                raise JobAborted(str(exc), code="AUTH_FAILED") from exc
+            self._fail(sha, exc.code)
+            return None
+
+        safety = {
+            "status": decision.status,
+            "provider": decision.provider,
+            "model": decision.model,
+            "confidence": round(decision.confidence, 6),
+            "attempts": decision.attempts,
+        }
+        self.manifest.transition(sha, ImageState(rec["state"]), safety=safety, last_error=None)
+        self._log.emit(
+            "safety_screened",
+            image_id=sha,
+            content_sha256=rec["sha256"],
+            folder_id=folder_id if (folder_id := rec["routing"]["folder_id"]) else None,
+            status=decision.status,
+            confidence=round(decision.confidence, 6),
+        )
+        return decision.status
 
     async def _run_action(self, sha: str, atype: str, folder_id: str) -> bool:
         self._set_state(sha, ImageState.ACTION_RUNNING)
@@ -523,11 +607,11 @@ class ImageFlowJob:
         if not src.exists():
             return self._action_failed(sha, atype, {}, "SOURCE_MISSING", permanent=True)
         try:
-            encoded = normalize_file(src, self._dirs["normalized"], sha)
+            encoded = normalize_file(src, self._dirs["normalized"], rec["sha256"])
         except PermanentError as exc:
             return self._action_failed(sha, atype, {}, exc.code, permanent=True)
 
-        context = ActionContext(job_id=self.job_id, image_sha256=sha, folder_id=folder_id, original_name=rec["original_filename"])
+        context = ActionContext(job_id=self.job_id, image_sha256=rec["sha256"], folder_id=folder_id, original_name=rec["original_filename"])
         try:
             async with self._limit("edit"):
                 result = await plugin.execute(encoded, context)

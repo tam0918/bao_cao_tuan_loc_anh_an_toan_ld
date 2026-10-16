@@ -27,7 +27,8 @@ def test_user_facing_text_never_names_models_or_internal_settings():
             texts.PROGRESS,
             texts.PPE_ACTION_LABEL,
             texts.NO_FOLDERS,
-            texts.done_summary(1, 1, 1, pending=1, failed=1),
+            texts.PPE_AUTOMATIC,
+            texts.done_summary(1, 1, 1, pending=1, failed=1, safety_review=1),
             texts.scan_summary(1, 1, 1),
             *texts._ABORTED.values(),
             *texts._PROBLEMS.values(),
@@ -61,3 +62,8 @@ def test_every_problem_a_move_can_report_has_wording():
     for code in ("DESTINATION_MISSING", "ROUTE_FAILED", "ACTION_FAILED", "SOURCE_MISSING", "LOST_SOURCE"):
         assert "(" not in texts.problem_message(code)  # not the generic fallback
     assert "SOMETHING_NEW" in texts.problem_message("SOMETHING_NEW")
+
+
+def test_photos_whose_ppe_could_not_be_judged_are_called_out():
+    assert "2 ảnh chưa xác định được PPE, nên xem lại" in texts.done_summary(5, 1, 0, safety_review=2)
+    assert "chưa xác định" not in texts.done_summary(5, 1, 0)

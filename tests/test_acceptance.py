@@ -166,7 +166,9 @@ def test_e_low_confidence_stays_in_root_and_goes_to_review(tmp_path):
     reloaded = build_job(root, primary, fallback=fallback, job_id="j_reload")
     reloaded.prepare()
     assert job_state(reloaded, sha) == ImageState.REVIEW_REQUIRED.value
-    assert (root / ".imageflow" / "review" / f"{sha}.jpg").exists()  # review copy, never the only copy
+    image_id = reloaded.manifest.get(sha)["image_id"]
+    # The review copy is named for the photo instance, not its content, so two identical photos cannot share one.
+    assert (root / ".imageflow" / "review" / f"{image_id}.jpg").exists()  # a copy, never the only one
     assert fallback.count == 1  # the fallback model was consulted before giving up
 
 
@@ -415,17 +417,16 @@ def test_name_collision_gets_a_deterministic_suffix(tmp_path):
     assert folder_files(root, "Khu") == ["red.jpg", "red__2.jpg"]
 
 
-def test_duplicate_bytes_in_root_are_processed_once(tmp_path):
+def test_duplicate_bytes_are_distinct_file_instances(tmp_path):
     root = tmp_path / "job"
     (root / "Khu").mkdir(parents=True)
     write_image(root / "a.jpg", RED)
     write_image(root / "b.jpg", RED)  # identical bytes
     clf = ScriptedClassifier(routed_to({RED: "Khu"}))
     report = run(build_job(root, clf))
-    assert clf.count == 1
-    assert report.skipped_duplicates == 1
-    assert folder_files(root, "Khu") == ["a.jpg"]
-    assert (root / "b.jpg").exists()
+    assert clf.count == 2
+    assert report.skipped_duplicates == 0
+    assert folder_files(root, "Khu") == ["a.jpg", "b.jpg"]
 
 
 def test_classifier_outage_moves_nothing_and_next_run_completes(tmp_path):

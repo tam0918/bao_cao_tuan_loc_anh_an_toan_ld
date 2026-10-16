@@ -240,7 +240,7 @@ def test_a_failed_compaction_does_not_fail_the_write_that_triggered_it(tmp_path,
     store = ManifestStore(tmp_path)
     store.load()
     for i in range(5):
-        store.put({"sha256": str(i) * 64, "state": ImageState.DISCOVERED.value, "actions": []})
+        store.put({"image_id": f"im_{i}", "sha256": str(i) * 64, "state": ImageState.DISCOVERED.value, "actions": []})
 
     again = ManifestStore(tmp_path)
     again.load()

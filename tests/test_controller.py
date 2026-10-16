@@ -69,6 +69,16 @@ def test_open_lists_the_folders_with_the_actions_saved_earlier(tmp_path):
     assert [(r.name, r.actions) for r in opened.folders] == [("Khu A", ()), ("Khu B", ("PPE_SIMULATION",))]
 
 
+def test_open_tells_the_window_whether_ppe_screening_is_automatic(tmp_path):
+    root = tmp_path / "job"
+    (root / "Khu").mkdir(parents=True)
+    per_folder = SessionController(lambda r: build_job(r, ScriptedClassifier(UNSURE), editor=MockEditor()))
+    automatic = SessionController(lambda r: build_job(r, ScriptedClassifier(UNSURE), editor=MockEditor(), safety=ScriptedClassifier(UNSURE)))
+
+    assert per_folder.open(root).screening_is_global is False
+    assert automatic.open(root).screening_is_global is True
+
+
 # ----- start ------------------------------------------------------------------------------------------------
 def test_start_applies_the_ticks_and_keeps_actions_the_window_does_not_offer(tmp_path):
     root = tmp_path / "job"
@@ -270,9 +280,9 @@ def test_review_offers_the_recreated_folder_not_its_stale_twin(tmp_path):
 
 # ----- completion screen figures ------------------------------------------------------------------------------
 def test_completion_numbers_count_unfinished_work_that_a_rerun_could_finish():
-    report = JobReport(job_id="j", deferred=2, internal_errors=1)
+    report = JobReport(job_id="j", deferred=2, internal_errors=1, safety_review_required=2)
     report.totals = {"complete": 9, "actions_success": 4, "review_required": 3, "failed": 1, "action_failed": 5}
-    assert completion_numbers(report) == {"classified": 9, "actioned": 4, "review": 3, "pending": 8, "failed": 1}
+    assert completion_numbers(report) == {"classified": 9, "actioned": 4, "review": 3, "pending": 8, "failed": 1, "safety_review": 2}
 
 
 def test_a_clean_run_has_nothing_pending():
