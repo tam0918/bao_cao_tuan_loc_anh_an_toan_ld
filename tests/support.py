@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import random
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
@@ -177,3 +181,50 @@ def sha_of(root: Path, rel: str) -> str:
     from imageflow.core.hashing import sha256_file
 
     return sha256_file(root / rel)
+
+
+def noisy_jpeg_bytes(size: tuple[int, int] = (200, 150), seed: int = 1) -> bytes:
+    """A JPEG of random pixels. It does not compress well, so cutting it short really breaks decoding."""
+    rng = random.Random(seed)
+    img = Image.new("RGB", size)
+    img.putdata([(rng.randrange(256), rng.randrange(256), rng.randrange(256)) for _ in range(size[0] * size[1])])
+    out = BytesIO()
+    img.save(out, format="JPEG", quality=90)
+    return out.getvalue()
+
+
+@contextlib.contextmanager
+def serve(handler_class):
+    """Run a local HTTP server for the duration of the block and yield its base URL.
+
+    The short poll interval keeps shutdown instant; the default 0.5 s would add half a second per test.
+    """
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def json_handler(responses: dict[str, tuple[int, dict[str, str], bytes]]):
+    """A request handler that answers each POST path with a canned (status, headers, body)."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            status, headers, body = responses[self.path]
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            return
+
+    return Handler

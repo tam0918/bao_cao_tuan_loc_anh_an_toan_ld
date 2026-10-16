@@ -38,15 +38,18 @@ def _flatten_alpha(img: Image.Image) -> Image.Image:
 
 
 def normalize_file(src: Path, cache_dir: Path, sha256: str) -> EncodedImage:
-    """Return the inference copy of ``src``. Reuses the cached copy when present."""
+    """Return the inference copy of ``src``. Reuses the cached copy when present.
+
+    Anything that cannot be decoded raises ``PermanentError`` so the pipeline marks the image
+    failed once, instead of retrying a damaged file on every run.
+    """
     cached = cache_dir / f"{sha256}.jpg"
     if cached.exists():
         return EncodedImage(data=cached.read_bytes(), mime="image/jpeg")
 
     raw = src.read_bytes()
     try:
-        probe = Image.open(BytesIO(raw))
-        probe.verify()  # detects truncated/corrupt files without decoding pixels
+        Image.open(BytesIO(raw)).verify()  # header-level check; it does not decode pixel data
         img = Image.open(BytesIO(raw))
         fmt = img.format
         width, height = img.size
@@ -58,22 +61,32 @@ def normalize_file(src: Path, cache_dir: Path, sha256: str) -> EncodedImage:
     if width * height > MAX_PIXELS:
         raise PermanentError("UNSUPPORTED_IMAGE", f"{width}x{height} exceeds pixel limit")
 
-    img = ImageOps.exif_transpose(img)  # auto-rotate from EXIF orientation
-    img = _flatten_alpha(img)
-    img = fit_within(img, NORMALIZED_MAX_SIDE)
+    try:
+        # Pillow decodes pixels lazily, here and not in verify(). A photo cut short by an interrupted
+        # copy therefore fails in this block, and has to be reported as corrupt like any other.
+        img = ImageOps.exif_transpose(img)  # auto-rotate from EXIF orientation
+        img = _flatten_alpha(img)
+        img = fit_within(img, NORMALIZED_MAX_SIDE)
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=NORMALIZED_JPEG_QUALITY, optimize=True)
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+        raise PermanentError("CORRUPTED_IMAGE", f"cannot decode {src.name}") from exc
 
-    out = BytesIO()
-    img.save(out, format="JPEG", quality=NORMALIZED_JPEG_QUALITY, optimize=True)
     data = out.getvalue()
     atomic_write_bytes(cached, data)
     return EncodedImage(data=data, mime="image/jpeg")
 
 
 def is_decodable(path: Path) -> bool:
-    """True when ``path`` is an image Pillow can fully open. Used to validate AI output."""
+    """True when every pixel of ``path`` decodes. Used to validate AI output before it is kept.
+
+    ``verify()`` alone is not enough: it accepts a truncated JPEG, so the image is fully loaded too.
+    """
     try:
         with Image.open(path) as img:
             img.verify()
+        with Image.open(path) as img:
+            img.load()
         return True
     except Exception:
         return False

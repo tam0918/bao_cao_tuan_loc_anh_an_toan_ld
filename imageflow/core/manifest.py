@@ -91,7 +91,12 @@ class ManifestStore:
         self._records[record["sha256"]] = record
         self._journal_len += 1
         if self._journal_len >= COMPACT_EVERY:
-            self.compact()
+            try:
+                self.compact()
+            except OSError:
+                # For example an antivirus scanner holding the snapshot open on Windows. The journal
+                # already has every record, so nothing is lost; compaction is retried on the next write.
+                pass
 
     def transition(self, sha256: str, target: ImageState, **fields: Any) -> dict[str, Any]:
         """Move a record to ``target`` (validated) and persist it together with ``fields``."""

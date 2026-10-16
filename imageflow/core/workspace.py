@@ -10,6 +10,7 @@ Contract:
 
 from __future__ import annotations
 
+import codecs
 import os
 import stat
 import unicodedata
@@ -64,12 +65,39 @@ def is_hidden(path: Path, st: os.stat_result) -> bool:
     return bool(attrs & getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 0))
 
 
+def _decode_rule(raw: bytes) -> str:
+    """Read a user-written text file whatever editor saved it.
+
+    Older Notepad versions save Vietnamese text as UTF-16 ("Unicode") or in the legacy Windows
+    code page. A strict UTF-8 read would raise and take the whole scan down with it.
+    """
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16", errors="replace")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1258", errors="replace")
+
+
 def read_rule(folder: Path) -> str | None:
     rule_path = folder / RULE_FILE_NAME
     if not rule_path.is_file():
         return None
-    text = rule_path.read_text(encoding="utf-8-sig").strip()
+    try:
+        text = _decode_rule(rule_path.read_bytes()).strip()
+    except OSError:
+        return None  # an unreadable optional file must not stop the job
     return text[:RULE_MAX_CHARS] or None
+
+
+def _identity(path: Path) -> tuple[int, int]:
+    """Directory identity (device, inode / file index), used to follow a folder across renames.
+
+    This has to come from os.stat: DirEntry.stat() reports zero for both on Windows, which would
+    silently turn rename tracking off on the platform this app ships for.
+    """
+    st = os.stat(path)
+    return st.st_dev, st.st_ino
 
 
 def scan_workspace(root: Path, artifact_suffixes: frozenset[str] = frozenset()) -> ScanResult:
@@ -85,15 +113,8 @@ def scan_workspace(root: Path, artifact_suffixes: frozenset[str] = frozenset()) 
         if entry.is_dir(follow_symlinks=False):
             if entry.name in SYSTEM_FOLDER_NAMES:
                 continue
-            result.folders.append(
-                FolderInfo(
-                    name=nfc(entry.name),
-                    path=path,
-                    dev=st.st_dev,
-                    ino=st.st_ino,
-                    rule=read_rule(path),
-                )
-            )
+            dev, ino = _identity(path)
+            result.folders.append(FolderInfo(name=nfc(entry.name), path=path, dev=dev, ino=ino, rule=read_rule(path)))
         elif entry.is_file(follow_symlinks=False):
             if entry.name in IGNORED_FILE_NAMES:
                 continue

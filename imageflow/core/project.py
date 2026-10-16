@@ -132,7 +132,10 @@ class ProjectStore:
         if unknown:
             raise ValueError(f"unknown action types: {sorted(unknown)}")
         reg = self._get(folder_id)
-        reg["actions"] = sorted(set(actions))
+        wanted = sorted(set(actions))
+        if reg["actions"] == wanted:
+            return  # saving costs an fsync per call, so skip the no-op
+        reg["actions"] = wanted
         self.save()
 
     def set_routing_mode(self, mode: str) -> None:

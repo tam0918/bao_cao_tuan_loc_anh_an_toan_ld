@@ -31,7 +31,7 @@ from .metrics import JobMetrics
 from .project import ProjectStore
 from .routing import DestinationMissing, deterministic_name, plan_recovery, route_file
 from .state_machine import RESUMABLE_STATES, ImageState
-from .workspace import ImageFile, ScanResult, choice_description, scan_workspace
+from .workspace import ImageFile, ScanResult, choice_description, nfc, scan_workspace
 
 SYSTEM_DIR = ".imageflow"
 SYSTEM_SUBDIRS = ("normalized", "staging", "outputs", "review", "logs", "temp")
@@ -45,13 +45,31 @@ _ACTION_STATES = frozenset({ImageState.ROUTED, ImageState.ACTION_PENDING, ImageS
 
 
 class JobAborted(Exception):
-    """A job-level failure (for example, the device token was refused). Stops the run."""
+    """A job-level failure that stops the whole run. ``code`` tells the caller which one."""
+
+    def __init__(self, message: str, code: str = "ABORTED") -> None:
+        super().__init__(message)
+        self.code = code
 
 
-@dataclass
+class UnknownFolder(ValueError):
+    """No active folder has the requested name."""
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     classify_concurrency: int = 4  # CLASSIFY_CONCURRENCY
     edit_concurrency: int = 2  # EDIT_CONCURRENCY
+    # Stop after this many images in a row could not be classified because the service is unreachable,
+    # instead of spending retries and minutes on every remaining image.
+    abort_after_unavailable: int = 5
+
+
+@dataclass(frozen=True)
+class FolderRow:
+    folder_id: str
+    name: str
+    actions: tuple[str, ...]
 
 
 @dataclass
@@ -93,18 +111,30 @@ class ImageFlowJob:
         self._dirs = {name: self.system / name for name in SYSTEM_SUBDIRS}
         self._scan: ScanResult | None = None
         self._log: EventLog | None = None
-        # Created per event loop (see _new_limits): asyncio primitives must not outlive their loop.
-        self._classify_sem: asyncio.Semaphore | None = None
-        self._edit_sem: asyncio.Semaphore | None = None
+        self._unavailable_streak = 0
+        # asyncio primitives belong to one event loop, so the limits are kept per loop (see _limit).
+        self._limits: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Semaphore]] = {}
 
-    def _new_limits(self, classify: bool) -> None:
-        if classify:
-            self._classify_sem = asyncio.Semaphore(self.config.classify_concurrency)
-        self._edit_sem = asyncio.Semaphore(self.config.edit_concurrency)
+    def _limit(self, name: str) -> asyncio.Semaphore:
+        """The shared concurrency limit ("classify" or "edit") for the running event loop.
+
+        Every caller on one loop shares one semaphore, so the cap holds for run() and for
+        assignments alike. A job is driven by one event loop at a time; it is not thread-safe.
+        """
+        loop = asyncio.get_running_loop()
+        cached = self._limits.get(name)
+        if cached is None or cached[0] is not loop:
+            size = self.config.classify_concurrency if name == "classify" else self.config.edit_concurrency
+            cached = (loop, asyncio.Semaphore(size))
+            self._limits[name] = cached
+        return cached[1]
 
     # ----- setup and read-only views -------------------------------------------
     def prepare(self) -> ScanResult:
         """Create system dirs, load the manifest, scan the workspace, sync folder identities."""
+        if not self.root.is_dir():
+            # Without this guard a mistyped path would get a stray .imageflow tree created under it.
+            raise NotADirectoryError(f"workspace folder not found: {self.root}")
         for directory in self._dirs.values():
             directory.mkdir(parents=True, exist_ok=True)
         self._log = EventLog(self._dirs["logs"] / f"{self.job_id}.jsonl", self.job_id)
@@ -112,10 +142,13 @@ class ImageFlowJob:
         self._scan = scan_workspace(self.root, self.actions.output_suffixes())
         for ev in self.project.sync(self._scan.folders):
             self._log.emit("folder_" + ev.kind, folder_id=ev.folder_id, detail=ev.detail)
+        return self._scan
+
+    def _fill_report_from_scan(self) -> None:
+        assert self._scan is not None
         self.report.images_found = len(self._scan.images)
         self.report.unsupported = list(self._scan.unsupported)
         self.report.folders = [f.name for f in self._scan.folders]
-        return self._scan
 
     def choices(self) -> list[Choice]:
         """The classification options: one per active folder. Built at runtime, nothing hard-coded."""
@@ -125,6 +158,23 @@ class ImageFlowJob:
             if folder is not None:
                 out.append(Choice(choice_id=fid, label=folder.name, description=choice_description(folder)))
         return sorted(out, key=lambda c: c.label)
+
+    def folder_rows(self) -> list[FolderRow]:
+        """The active folders with their assigned actions, for screens and command lines to list."""
+        rows = [
+            FolderRow(folder_id=fid, name=folder.name, actions=tuple(self.project.actions_for(fid)))
+            for fid in self.project.active_ids()
+            if (folder := self.project.live.get(fid)) is not None
+        ]
+        return sorted(rows, key=lambda r: r.name)
+
+    def resolve_folder(self, name: str) -> str:
+        """folder_id of the active folder called ``name``. A folder that no longer exists never matches."""
+        wanted = nfc(name)
+        for row in self.folder_rows():
+            if row.name == wanted:
+                return row.folder_id
+        raise UnknownFolder(name)
 
     def review_items(self) -> list[dict[str, Any]]:
         """Images waiting for a human decision, with the top candidates for the review screen."""
@@ -148,10 +198,15 @@ class ImageFlowJob:
         return folder.name if folder else None
 
     # ----- run -----------------------------------------------------------------
-    async def run(self) -> JobReport:
+    async def run(self, *, refresh: bool = True) -> JobReport:
+        """Process every pending image. ``refresh=False`` reuses the scan of a prepare() just made."""
         started = time.perf_counter()
-        self._new_limits(classify=True)
-        self.prepare()
+        self.report = JobReport(job_id=self.job_id)  # the counters describe this run only
+        self.metrics = JobMetrics()
+        self._unavailable_streak = 0
+        if refresh or self._scan is None:
+            self.prepare()
+        self._fill_report_from_scan()
         choices = self.choices()
         pending = self._pending()
         self._log.emit("job_started", pending=len(pending), folders=len(choices))
@@ -165,11 +220,18 @@ class ImageFlowJob:
         self._finish(started)
         return self.report
 
-    async def assign(self, sha256: str, folder_id: str) -> None:
-        """The user picks the folder for an image in review. It is then routed and actioned like any other."""
-        self._new_limits(classify=False)
-        if self._scan is None:
-            self.prepare()
+    async def assign(self, sha256: str, folder_id: str) -> str | None:
+        """The user picks the folder for an image in review. It is then routed and actioned like any other.
+
+        Returns None when the image was routed and its actions finished. Otherwise it returns a
+        problem code that the caller should tell the user about:
+
+        * ``DESTINATION_MISSING``: the folder is gone. The image is back in the review list.
+        * ``ROUTE_FAILED``: the file could not be moved yet (for example it is locked). The next run retries.
+        * ``ACTION_FAILED``: the image was moved but an action failed. The next run retries it.
+        * ``SOURCE_MISSING`` / ``LOST_SOURCE``: the original file is gone.
+        """
+        self.prepare()  # the folder may have been renamed or removed since the last run
         rec = self.manifest.get(sha256)
         if rec is None or rec["state"] != ImageState.REVIEW_REQUIRED.value:
             raise ValueError("image is not waiting for review")
@@ -185,9 +247,15 @@ class ImageFlowJob:
             "second_probability": None,
         }
         self.manifest.transition(sha256, ImageState.CLASSIFIED, classification=classification, last_error=None)
-        if self._route(sha256):
-            self._remove_review_copy(sha256)  # only after the original has safely left the root
-            await self._run_actions(sha256)
+        if not self._route(sha256):
+            problem = self.manifest.get(sha256)["last_error"] or "ROUTE_FAILED"
+            if self._state(sha256) == ImageState.CLASSIFIED:
+                # Nothing was moved, so the image goes back to the review list for another choice.
+                self.manifest.transition(sha256, ImageState.REVIEW_REQUIRED, last_error=problem)
+            return problem
+        self._remove_review_copy(sha256)  # only after the original has safely left the root
+        await self._run_actions(sha256)
+        return "ACTION_FAILED" if self._state(sha256) == ImageState.ACTION_FAILED else None
 
     # ----- planning --------------------------------------------------------------
     def _pending(self) -> list[str]:
@@ -272,20 +340,30 @@ class ImageFlowJob:
             self.manifest.transition(sha, ImageState.NORMALIZED, normalized_rel=normalized_rel)
         if not choices:
             return False  # no category folder yet. The image waits in NORMALIZED.
+        if self._unavailable_streak >= self.config.abort_after_unavailable:
+            return False  # the job is already stopping because the service is down: leave this image for the next run
         self._set_state(sha, ImageState.CLASSIFYING)
         try:
-            async with self._classify_sem:
+            async with self._limit("classify"):
                 decision = await self.classifier.decide(encoded, choices)
         except ClassifierUnavailable:
             self.manifest.transition(sha, ImageState.NORMALIZED, last_error="CLASSIFIER_UNAVAILABLE")
             self.report.deferred += 1
             self._log.emit("classify_deferred", sha256=sha, reason="CLASSIFIER_UNAVAILABLE")
+            self._unavailable_streak += 1
+            if self._unavailable_streak >= self.config.abort_after_unavailable:
+                raise JobAborted(
+                    f"the classification service is unreachable ({self._unavailable_streak} images in a row); "
+                    "check the connection and run again",
+                    code="SERVICE_UNAVAILABLE",
+                )
             return False
         except PermanentError as exc:
             if exc.code == "AUTH_FAILED":
-                raise JobAborted(str(exc)) from exc
+                raise JobAborted(str(exc), code="AUTH_FAILED") from exc
             self._fail(sha, exc.code)
             return False
+        self._unavailable_streak = 0
 
         attempts = [a.as_dict() for a in decision.attempts]
         self.metrics.observe_decision(decision)
@@ -352,7 +430,12 @@ class ImageFlowJob:
                 self._fail(sha, "LOST_SOURCE")
                 return False
             if plan.action == "FINISH_MOVE":
-                os.unlink(src)  # the link already exists at the destination
+                try:
+                    os.unlink(src)  # the link already exists at the destination
+                except OSError as exc:  # for example the file is open in another program on Windows
+                    self._log.emit("route_retry", sha256=sha, error=repr(exc))
+                    self._note_error(sha, "ROUTE_FAILED")
+                    return False
             if plan.action in ("DONE", "FINISH_MOVE"):
                 return self._mark_routed(sha, plan.destination, mode, folder_id)
             # REROUTE: fall through and place the file again with a fresh deterministic name.
@@ -441,11 +524,11 @@ class ImageFlowJob:
 
         context = ActionContext(job_id=self.job_id, image_sha256=sha, folder_id=folder_id, original_name=rec["original_filename"])
         try:
-            async with self._edit_sem:
+            async with self._limit("edit"):
                 result = await plugin.execute(encoded, context)
         except PermanentError as exc:
             if exc.code == "AUTH_FAILED":
-                raise JobAborted(str(exc)) from exc
+                raise JobAborted(str(exc), code="AUTH_FAILED") from exc
             return self._action_failed(sha, atype, {}, exc.code, permanent=True)
 
         base = {"provider": result.provider, "model": result.model, "latency_ms": result.latency_ms, "retries": result.retries}

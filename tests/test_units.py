@@ -319,14 +319,24 @@ def test_primary_outage_uses_the_fallback():
 
 
 def test_every_model_down_is_unavailable_not_review():
-    primary = Scripted("clef-flash", [TransientError("NETWORK")])
-    fallback = Scripted("clef", [TransientError("NETWORK")])
+    primary = Scripted("clef-flash", [TransientError("UPSTREAM_UNAVAILABLE")])
+    fallback = Scripted("clef", [TransientError("UPSTREAM_UNAVAILABLE")])
     with pytest.raises(ClassifierUnavailable):
         asyncio.run(_engine(primary, fallback).decide(IMAGE, CHOICES))
+    assert fallback.count > 0  # a model-specific outage still gets a second opinion
+
+
+def test_a_dead_network_does_not_waste_requests_on_the_fallback():
+    primary = Scripted("clef-flash", [TransientError("NETWORK")])
+    fallback = Scripted("clef", [_result("clef", 0.95, 0.05)])
+    with pytest.raises(ClassifierUnavailable):
+        asyncio.run(_engine(primary, fallback).decide(IMAGE, CHOICES))
+    assert primary.count == 3  # one try plus two retries
+    assert fallback.count == 0  # same gateway, same network: it cannot do better
 
 
 def test_outage_on_one_model_and_low_confidence_on_the_other_means_review():
-    primary = Scripted("clef-flash", [TransientError("NETWORK")])
+    primary = Scripted("clef-flash", [TransientError("UPSTREAM_UNAVAILABLE")])  # this model only, not the network
     fallback = Scripted("clef", [_result("clef", 0.55, 0.45)])
     decision = asyncio.run(_engine(primary, fallback).decide(IMAGE, CHOICES))
     assert decision.kind == "REVIEW"

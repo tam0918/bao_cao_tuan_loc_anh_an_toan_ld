@@ -36,7 +36,7 @@ _TRANSITIONS: dict[ImageState, set[ImageState]] = {
     ImageState.REVIEW_REQUIRED: {ImageState.CLASSIFIED},  # the user assigns a folder by hand
     ImageState.ROUTING: {ImageState.ROUTED, ImageState.CLASSIFIED},
     ImageState.ROUTED: {ImageState.ACTION_PENDING, ImageState.COMPLETE},
-    ImageState.ACTION_PENDING: {ImageState.ACTION_RUNNING},
+    ImageState.ACTION_PENDING: {ImageState.ACTION_RUNNING, ImageState.COMPLETE},  # COMPLETE: action removed
     ImageState.ACTION_RUNNING: {ImageState.COMPLETE, ImageState.ACTION_FAILED},
     # ACTION_FAILED -> ACTION_RUNNING retries on resume. -> COMPLETE when the user removed the action.
     ImageState.ACTION_FAILED: {ImageState.ACTION_RUNNING, ImageState.COMPLETE},

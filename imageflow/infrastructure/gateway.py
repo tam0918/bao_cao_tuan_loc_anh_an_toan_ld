@@ -8,8 +8,8 @@ upstream request formats.
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
-import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +19,17 @@ from ..errors import PermanentError, TransientError
 
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 PERMANENT_STATUS_CODES = frozenset({400, 404, 409, 413, 415, 422})
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib copies the Authorization header onto the redirected request, so following a redirect
+    could send the device token to another host or over plain http. The gateway never redirects."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 class GatewayClient:
@@ -48,15 +59,17 @@ class GatewayClient:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            with _OPENER.open(req, timeout=self._timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
             raise _map_http_error(exc) from exc
-        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+            # Timeouts, resets, DNS and TLS failures, and a reply cut off mid-body (IncompleteRead is an
+            # HTTPException, not an OSError) are all flaky-network symptoms. Retry them.
             raise TransientError("NETWORK", str(exc)) from exc
         try:
             data = json.loads(raw)
-        except json.JSONDecodeError as exc:
+        except ValueError as exc:  # JSONDecodeError, and UnicodeDecodeError for a body that is not UTF-8
             raise PermanentError("INVALID_SCHEMA", "gateway returned non-JSON") from exc
         if not isinstance(data, dict):
             raise PermanentError("INVALID_SCHEMA", "gateway returned a non-object")
@@ -68,6 +81,8 @@ def _map_http_error(exc: urllib.error.HTTPError) -> Exception:
     upstream_code = _error_code(exc)
     if status in (401, 403):
         return PermanentError("AUTH_FAILED", f"gateway refused credentials ({status})")
+    if status == 408:
+        return TransientError("TIMEOUT", "gateway request timed out", retry_after=_retry_after(exc))
     if status == 429:
         return TransientError("RATE_LIMITED", "gateway rate limit", retry_after=_retry_after(exc))
     if status >= 500:
@@ -90,7 +105,7 @@ def _retry_after(exc: urllib.error.HTTPError) -> float | None:
 def _error_code(exc: urllib.error.HTTPError) -> str | None:
     try:
         payload = json.loads(exc.read() or b"{}")
-    except (json.JSONDecodeError, OSError):
+    except (ValueError, OSError):
         return None
     err = payload.get("error") if isinstance(payload, dict) else None
     code = err.get("code") if isinstance(err, dict) else None

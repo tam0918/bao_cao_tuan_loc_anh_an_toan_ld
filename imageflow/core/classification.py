@@ -86,13 +86,13 @@ class ClassificationEngine:
     async def decide(self, image: EncodedImage, choices: list[Choice]) -> Decision:
         attempts: list[Attempt] = []
         best_probs: dict[str, float] | None = None
-        transient_failures = 0
 
         for provider in self._providers:
             attempt, probs = await self._attempt(provider, image, choices)
             attempts.append(attempt)
             if attempt.outcome == "error":
-                transient_failures += 1
+                if attempt.error_code == "NETWORK":
+                    break  # the fallback model sits behind the same gateway, so it cannot do better
                 continue
             if probs is None:
                 continue
@@ -103,7 +103,7 @@ class ClassificationEngine:
                 return _route_decision(provider, ranked, attempts)
             attempt.outcome = "rejected"
 
-        if best_probs is None and transient_failures == len(self._providers):
+        if best_probs is None and all(a.outcome == "error" for a in attempts):
             raise ClassifierUnavailable("all classifier models failed transiently")
         ranked = rank(best_probs) if best_probs else []
         return Decision(
